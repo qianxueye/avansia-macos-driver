@@ -73,6 +73,14 @@ typed setting after its read protocol is established.
 
 ## Packaging and licensing
 
+Installation identity is read through `AvansiaSetup queue-info`. The native
+bridge queries the explicit local scheduler for the exact queue name and
+device URI. Only an explicit IPP not-found response means absence; connection,
+authorization and malformed-response failures remain errors. Human-readable
+CUPS output is not an identity interface, and command locale settings do not
+guarantee the language selected by macOS CUPS. Retained runtime files are
+separate from verified queue/service installation state.
+
 The public repository contains owned native sources, synthetic tests, build
 scripts, reviewed CUPS patches and required open-source notices. The source is
 MIT licensed. Do not include personal card artwork, PDFs, photos, device logs,

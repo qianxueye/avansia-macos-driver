@@ -222,8 +222,9 @@ struct NativeCommandRunner: AppCommandRunning {
     init(base: URL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/AvansiaDriver"),
          package: URL = (Bundle.main.resourceURL ?? Bundle.main.bundleURL).appendingPathComponent("Driver"),
          fixture: URL? = ProcessInfo.processInfo.environment["AVANSIA_UI_FIXTURE"].map { URL(fileURLWithPath: $0) },
-         runner: any AppCommandRunning = NativeCommandRunner(), installationProbe: AppInstallationProbe = AppInstallationProbe()) {
-        self.base = base; self.package = package; self.fixture = fixture; self.runner = runner; self.installationProbe = installationProbe
+         runner: any AppCommandRunning = NativeCommandRunner(), installationProbe: AppInstallationProbe? = nil) {
+        self.base = base; self.package = package; self.fixture = fixture; self.runner = runner
+        self.installationProbe = installationProbe ?? AppInstallationProbe(setup: package.appendingPathComponent("AvansiaSetup"), runner: runner)
     }
     func reloadCache() {
         runtimeAvailable = FileManager.default.isExecutableFile(atPath: core.path)
@@ -278,7 +279,7 @@ struct NativeCommandRunner: AppCommandRunning {
         defer { commandID = nil; operation = nil; reloadCache() }
         do {
             let result = try await runner.run(executable, arguments, timeout: timeout) { [weak self] text in
-                Task { @MainActor in if self?.commandID == id { self?.output = text } }
+                Task { @MainActor [weak self] in if self?.commandID == id { self?.output = text } }
             }
             output = result.output
             guard result.status == 0 else { throw AppFailure.message(result.output.isEmpty ? "Command failed (exit \(result.status))." : result.output) }

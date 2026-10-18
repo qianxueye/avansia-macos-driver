@@ -5,6 +5,8 @@ let setupTestHome = FileManager.default.temporaryDirectory.appendingPathComponen
 
 struct MockSetup {
     var queueURI: String?
+    var queryError = false
+    var localizedQueueOutput = false
     var loaded = false
     var accepting = true
     var paused = false
@@ -79,7 +81,7 @@ func setupTestRun(_ executable: String, _ args: [String], _ checked: Bool) throw
     case "codesign": return (0, "")
     case "lpstat":
         if args.first == "-W" { return (0, mock.pending) }
-        return mock.queueURI.map { (Int32(0), "device for \(queue): \($0)\n") } ?? (1, "Unknown queue")
+        return mock.queueURI.map { (Int32(0), mock.localizedQueueOutput ? "用于\(queue)的设备：\($0)\n" : "device for \(queue): \($0)\n") } ?? (1, "Unknown queue")
     case "launchctl":
         switch args[0] {
         case "print": return (mock.loaded ? 0 : 1, "")
@@ -110,6 +112,12 @@ func setupTestRun(_ executable: String, _ args: [String], _ checked: Bool) throw
     default: throw SetupError("Unexpected command: " + executable)
     }
     return (0, "")
+}
+
+func setupTestQueueURI() throws -> String? {
+    mock.calls.append("queue-query")
+    if mock.queryError { throw SetupError("Injected CUPS queue query failure") }
+    return mock.queueURI
 }
 
 func setupTestLock() throws -> Int32 {
@@ -195,6 +203,49 @@ func assertPreviousInstallation(accepting: Bool, paused: Bool, loaded: Bool = tr
         var count = 0
         func test(_ name: String, _ body: () throws -> Void) throws {
             try body(); count += 1; print("PASS: " + name)
+        }
+        try test("Native ownership ignores localized human output and requires exact device URI") {
+            try resetSetup(installed: true)
+            mock.localizedQueueOutput = true; mock.failure = "defaults"
+            let human = try setupTestRun("/usr/bin/lpstat", ["-v", queue], false).1
+            try expectSetup(human.hasPrefix("用于"), "Fixture uses the actual Chinese macOS prefix")
+            try expectSetup(ownedQueue(try queueDeviceURI()), "Native exact URI is owned regardless of human language")
+            for candidate in [uri + "/", "ipp://127.0.0.1:18631/ipp/print", "ipp://other.invalid/ipp/print"] {
+                try expectSetup(!ownedQueue(candidate), "Similar or foreign URI is never owned")
+            }
+            try expectFailure("prior installation was restored") { try upgrade(source) }
+            try assertPreviousInstallation(accepting: true, paused: false)
+        }
+        try test("Native queue absence and errors remain distinct and precede mutation") {
+            try resetSetup()
+            try expectSetup(try queueDeviceURI() == nil, "Missing queue is explicit absence")
+            mock.queryError = true
+            for operation in ["install", "upgrade", "uninstall", "queue-info"] {
+                try expectFailure("CUPS queue query failure") { try setupMain(["AvansiaSetup", operation, source.path].prefix(operation == "queue-info" || operation == "uninstall" ? 2 : 3).map { $0 }) }
+            }
+            try expectSetup(mock.calls.allSatisfy { $0 == "queue-query" }, "Unknown queue state never becomes absence or triggers commands")
+        }
+        try test("queue-info emits only machine JSON for found and missing queues") {
+            try resetSetup()
+            for device in [nil, uri, "ipp://other.invalid/ipp/print"] as [String?] {
+                mock.queueURI = device
+                let capture = setupTestHome.appendingPathComponent("stdout.json")
+                _ = FileManager.default.createFile(atPath: capture.path, contents: nil)
+                let output = try FileHandle(forWritingTo: capture)
+                fflush(stdout)
+                let original = dup(STDOUT_FILENO)
+                guard original >= 0 && dup2(output.fileDescriptor, STDOUT_FILENO) >= 0 else { throw SetupError("Cannot capture queue-info stdout") }
+                do { try setupMain(["AvansiaSetup", "queue-info"]) }
+                catch { fflush(stdout); dup2(original, STDOUT_FILENO); close(original); throw error }
+                fflush(stdout); dup2(original, STDOUT_FILENO); close(original); try output.close()
+                let data = try Data(contentsOf: capture)
+                let information = try JSONSerialization.jsonObject(with: data) as! [String: Any]
+                try expectSetup(information.count == 2 && information["exists"] as? Bool == (device != nil), "JSON existence matches native query")
+                if let device { try expectSetup(information["device_uri"] as? String == device, "JSON preserves exact device URI") }
+                else { try expectSetup(information["device_uri"] is NSNull, "Missing queue uses JSON null") }
+            }
+            try expectFailure("no arguments") { try setupMain(["AvansiaSetup", "queue-info", "other-queue"]) }
+            try expectSetup(mock.calls.allSatisfy { $0 == "queue-query" }, "queue-info invokes no mutations or human commands")
         }
         try test("Initial install configures native service, PPD and queue defaults") {
             try resetSetup()

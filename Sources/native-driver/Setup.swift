@@ -66,9 +66,19 @@ func requireNoCard() throws {
     }
 }
 
-func ownedQueue(_ information: String) -> Bool {
-    information.trimmingCharacters(in: .whitespacesAndNewlines) == "device for \(queue): \(uri)"
+func queueDeviceURI() throws -> String? {
+#if SETUP_TESTS
+    return try setupTestQueueURI()
+#else
+    var device = [CChar](repeating: 0, count: 4096)
+    var error = [CChar](repeating: 0, count: 1024)
+    let result = avansia_queue_uri(queue, &device, device.count, &error, error.count)
+    guard result >= 0 else { throw SetupError("Cannot query the Avansia queue: " + String(cString: error)) }
+    return result == 0 ? nil : String(cString: device)
+#endif
 }
+
+func ownedQueue(_ deviceURI: String?) -> Bool { deviceURI == uri }
 
 func setupLock() throws -> Int32 {
 #if SETUP_TESTS
@@ -147,7 +157,7 @@ func augmentedPPD(_ source: String, icon: URL) throws -> String {
 }
 
 func install(_ source: URL, prepared: URL? = nil) throws {
-    guard try run("/usr/bin/lpstat", ["-v", queue], checked: false).0 != 0 else {
+    guard try queueDeviceURI() == nil else {
         throw SetupError("An Evolis_Avansia queue already exists; use upgrade after jobs finish")
     }
     try requireNoCard()
@@ -158,7 +168,7 @@ func install(_ source: URL, prepared: URL? = nil) throws {
     var lock = try setupLock()
     defer { if lock >= 0 { close(lock) } }
     try requireNoCard()
-    guard try run("/usr/bin/lpstat", ["-v", queue], checked: false).0 != 0,
+    guard try queueDeviceURI() == nil,
           try run("/bin/launchctl", ["print", service], checked: false).0 != 0,
           !files.fileExists(atPath: agent.path) else { throw SetupError("Another installation became active") }
     try verifyPort()
@@ -221,7 +231,7 @@ func install(_ source: URL, prepared: URL? = nil) throws {
         do {
             if lock < 0 { lock = try setupLock() }
             try requireNoCard()
-            if queueAttempted, try run("/usr/bin/lpstat", ["-v", queue], checked: false).0 == 0 {
+            if queueAttempted, try queueDeviceURI() != nil {
                 guard try pendingJobs().isEmpty else { throw SetupError("A queue job became pending") }
             }
         } catch {
@@ -231,9 +241,9 @@ func install(_ source: URL, prepared: URL? = nil) throws {
         func recover(_ action: () throws -> Void) { do { try action() } catch { rollbackErrors.append(String(describing: error)) } }
         if queueAttempted {
             recover {
-                let current = try run("/usr/bin/lpstat", ["-v", queue], checked: false)
-                if current.0 == 0 {
-                    guard ownedQueue(current.1), try pendingJobs().isEmpty else { throw SetupError("Rollback retained a changed or nonempty queue") }
+                let current = try queueDeviceURI()
+                if current != nil {
+                    guard ownedQueue(current), try pendingJobs().isEmpty else { throw SetupError("Rollback retained a changed or nonempty queue") }
                     try requireNoCard()
                     try run("/usr/sbin/lpadmin", ["-x", queue])
                 }
@@ -262,8 +272,8 @@ func install(_ source: URL, prepared: URL? = nil) throws {
 }
 
 func restoreQueueState(accepting: Bool, paused: Bool) throws {
-    let current = try run("/usr/bin/lpstat", ["-v", queue], checked: false)
-    guard current.0 == 0, ownedQueue(current.1) else {
+    let current = try queueDeviceURI()
+    guard current != nil, ownedQueue(current) else {
         throw SetupError("The queue changed before its previous state could be restored")
     }
     try run("/usr/sbin/" + (paused ? "cupsdisable" : "cupsenable"), [queue])
@@ -278,27 +288,27 @@ func restoreQueueState(accepting: Bool, paused: Bool) throws {
 }
 
 func uninstall() throws {
-    let existing = try run("/usr/bin/lpstat", ["-v", queue], checked: false)
+    let existing = try queueDeviceURI()
     var accepted = false, paused = false, restoreState = false
-    if existing.0 == 0 {
-        guard ownedQueue(existing.1) else { throw SetupError("Refusing to remove another printer") }
+    if existing != nil {
+        guard ownedQueue(existing) else { throw SetupError("Refusing to remove another printer") }
         let information = try run("/usr/bin/ipptool", ["-tv", "ipp://localhost:631/printers/" + queue,
                                    "/usr/share/cups/ipptool/get-printer-attributes.test"]).1
         accepted = information.contains("printer-is-accepting-jobs (boolean) = true")
         paused = information.contains("printer-state (enum) = stopped")
     }
     do {
-        if existing.0 == 0 {
+        if existing != nil {
             restoreState = true
             try run("/usr/sbin/cupsreject", ["-r", "Avansia uninstall in progress", queue])
         }
         let lock = try setupLock()
         defer { close(lock) }
-        if existing.0 == 0 {
+        if existing != nil {
             guard try pendingJobs().isEmpty else { throw SetupError("Finish or cancel Avansia jobs first") }
         }
         try requireNoCard()
-        if existing.0 == 0 {
+        if existing != nil {
             try run("/usr/sbin/lpadmin", ["-x", queue])
             restoreState = false
         }
@@ -320,9 +330,9 @@ func uninstall() throws {
 }
 
 func upgrade(_ source: URL) throws {
-    let existing = try run("/usr/bin/lpstat", ["-v", queue], checked: false)
-    if existing.0 != 0 { try install(source); return }
-    guard ownedQueue(existing.1) else { throw SetupError("Refusing to update another printer") }
+    let existing = try queueDeviceURI()
+    if existing == nil { try install(source); return }
+    guard ownedQueue(existing) else { throw SetupError("Refusing to update another printer") }
     try requireNoCard()
     guard try pendingJobs().isEmpty else { throw SetupError("Finish or cancel Avansia jobs before updating") }
     let staging = try stageRuntime(source)
@@ -353,9 +363,9 @@ func upgrade(_ source: URL) throws {
                   oldRuntimeIdentity[.systemFileNumber] as? NSNumber == restoredIdentity[.systemFileNumber] as? NSNumber else {
                 throw SetupError("The prior runtime was not restored; automatic update recovery was deferred")
             }
-            let current = try run("/usr/bin/lpstat", ["-v", queue], checked: false)
-            if current.0 == 0 {
-                guard ownedQueue(current.1), try pendingJobs().isEmpty else {
+            let current = try queueDeviceURI()
+            if current != nil {
+                guard ownedQueue(current), try pendingJobs().isEmpty else {
                     throw SetupError("The current queue changed or has work; automatic update rollback was deferred")
                 }
             }
@@ -372,7 +382,7 @@ func upgrade(_ source: URL) throws {
                   (try? Data(contentsOf: agent)) == oldAgent else {
                 throw SetupError("The prior service plist or loaded state was not restored")
             }
-            if current.0 != 0 {
+            if current == nil {
                 let restored = base.appendingPathComponent(".restore-" + UUID().uuidString + ".ppd")
                 defer { try? files.removeItem(at: restored) }
                 try oldPPD.write(to: restored, options: .atomic)
@@ -389,7 +399,7 @@ func upgrade(_ source: URL) throws {
 }
 
 func setupMain(_ arguments: [String]) throws {
-    guard arguments.count >= 2 else { throw SetupError("Usage: AvansiaSetup install|upgrade [package-folder] | import-sdk FILE | uninstall | status | cancel-stopped REMOTE-ID | acknowledge --confirm-card-inspected") }
+    guard arguments.count >= 2 else { throw SetupError("Usage: AvansiaSetup install|upgrade [package-folder] | import-sdk FILE | uninstall | status | queue-info | cancel-stopped REMOTE-ID | acknowledge --confirm-card-inspected") }
     switch arguments[1] {
     case "install", "upgrade":
         guard arguments.count <= 3 else { throw SetupError("Specify at most one package folder") }
@@ -402,6 +412,13 @@ func setupMain(_ arguments: [String]) throws {
         try RuntimeAssets.importSDK(URL(fileURLWithPath: arguments[2]), to: destination)
         print("Verified and cached the official native SDK library. Install or update the driver to use it.")
     case "uninstall": try uninstall()
+    case "queue-info":
+        guard arguments.count == 2 else { throw SetupError("queue-info takes no arguments") }
+        let device = try queueDeviceURI()
+        var information: [String: Any] = ["exists": device != nil, "device_uri": NSNull()]
+        if let device { information["device_uri"] = device }
+        let data = try JSONSerialization.data(withJSONObject: information, options: [.sortedKeys])
+        print(String(decoding: data, as: UTF8.self))
     case "status":
         if files.fileExists(atPath: base.appendingPathComponent("spool/active-job.ipp").path) {
             print(try run("/usr/bin/ipptool", ["-tv", uri, "/usr/share/cups/ipptool/get-jobs.test"], checked: false).1)

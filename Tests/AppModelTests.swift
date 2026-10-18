@@ -5,7 +5,7 @@ func expect(_ condition: @autoclosure () -> Bool, _ message: String) throws {
     if !condition() { throw AppFailure.message("Test failed: " + message) }
 }
 actor InstallationCommandFixture: AppCommandRunning {
-    var queue = CommandResult(status: 0, output: "device for OtherFixture: file:///dev/null\n")
+    var queue = CommandResult(status: 0, output: #"{"exists":false,"device_uri":null}"#)
     var service = CommandResult(status: 113, output: "Could not find service \"local.avansia.ipp\" in domain for user gui: 501\n")
     var calls: [(String, [String])] = []
     var failNextProbe = false
@@ -14,8 +14,8 @@ actor InstallationCommandFixture: AppCommandRunning {
     func history() -> [(String, [String])] { calls }
     func run(_ executable: URL, _ arguments: [String], timeout: TimeInterval, progress: @escaping @Sendable (String) -> Void) async throws -> CommandResult {
         calls.append((executable.path, arguments))
-        if executable.path == "/usr/bin/lpstat" {
-            try expect(arguments == ["-v"] && timeout == 4, "Queue probe is bounded and read-only")
+        if arguments == ["queue-info"] {
+            try expect(executable.lastPathComponent == "AvansiaSetup" && timeout == 4, "Queue probe invokes the bounded native Setup JSON interface")
             if failNextProbe { failNextProbe = false; throw AppFailure.timedOut("device for OtherFixture: file:///dev/null") }
             try await Task.sleep(nanoseconds: 30_000_000)
             return queue
@@ -25,10 +25,10 @@ actor InstallationCommandFixture: AppCommandRunning {
             return service
         }
         if arguments.first == "uninstall" {
-            queue = CommandResult(status: 0, output: "")
+            queue = CommandResult(status: 0, output: #"{"exists":false,"device_uri":null}"#)
             service = CommandResult(status: 113, output: "Could not find service \"local.avansia.ipp\" in domain for user gui: 501\n")
         } else if arguments.first == "install" {
-            queue = CommandResult(status: 0, output: "device for Evolis_Avansia: ipp://localhost:18631/ipp/print\n")
+            queue = CommandResult(status: 0, output: #"{"exists":true,"device_uri":"ipp://localhost:18631/ipp/print"}"#)
             service = CommandResult(status: 0, output: "Synthetic loaded service\n")
         }
         return CommandResult(status: 0, output: "Synthetic command completed\n")
@@ -78,7 +78,7 @@ actor InstallationCommandFixture: AppCommandRunning {
             setenv("LANG", "zh_CN.UTF-8", 1)
             let result = try await NativeCommandRunner().run(helper, ["locale"])
             let environment = try JSONSerialization.jsonObject(with: Data(result.output.utf8)) as? [String: String]
-            try expect(result.status == 0 && environment?["LC_ALL"] == "C" && environment?["LANG"] == "C", "Native command boundary overrides inherited Chinese locale with canonical C output")
+            try expect(result.status == 0 && environment?["LC_ALL"] == "C" && environment?["LANG"] == "C", "Native child receives explicit environment values; this does not establish CLI output language")
             try expect(AppStrings.text("Unknown") == "\u{672A}\u{77E5}", "Command locale does not change the localized Chinese UI")
         }
         try await verifyCommandLocale()
@@ -87,8 +87,7 @@ actor InstallationCommandFixture: AppCommandRunning {
         }
         try write(snapshot())
         let probeRunner = InstallationCommandFixture()
-        let installation = UtilityModel(base: base, package: package, fixture: nil, runner: probeRunner,
-                                        installationProbe: AppInstallationProbe(runner: probeRunner))
+        let installation = UtilityModel(base: base, package: package, fixture: nil, runner: probeRunner)
         installation.reloadCache()
         await installation.refreshInstallation()
         try expect(installation.runtimeAvailable && installation.installationState == .notInstalled && installation.canInstall && !installation.canPrint && !installation.canUpdate,
@@ -97,21 +96,40 @@ actor InstallationCommandFixture: AppCommandRunning {
         try expect(installation.canReadDetails, "Retained runtime remains available for explicit diagnostics")
         await installation.printPDF(folder.appendingPathComponent("never-submitted.pdf"), copies: 1, sides: "one-sided", scaling: "none")
         var probeCalls = await probeRunner.history()
+        try expect(probeCalls.filter { $0.1 == ["queue-info"] }.allSatisfy { $0.0 == package.appendingPathComponent("AvansiaSetup").path }, "Default installation probe resolves Setup from the model's injected package")
+        try expect(!probeCalls.contains { $0.0 == "/usr/bin/lpstat" }, "Installation status never parses localized lpstat output")
         try expect(!probeCalls.contains { $0.0 == "/usr/bin/lp" }, "Removed queue is rejected before PDF submission")
         await installation.setupAction("install")
         try expect(installation.installationState == .installed && installation.canPrint && !installation.canInstall, "Successful setup refreshes verified installation state")
         await installation.setupAction("uninstall")
         try expect(installation.runtimeAvailable && installation.installationState == .notInstalled && installation.canInstall && !installation.canPrint,
                    "Successful uninstall refreshes the UI even when runtime files remain")
-        let ownedQueue = CommandResult(status: 0, output: "device for Evolis_Avansia: ipp://localhost:18631/ipp/print\n")
+        let ownedQueue = CommandResult(status: 0, output: #"{"exists":true,"device_uri":"ipp://localhost:18631/ipp/print"}"#)
         let loadedService = CommandResult(status: 0, output: "Synthetic loaded service\n")
         let absentService = CommandResult(status: 113, output: "Could not find service \"local.avansia.ipp\" in domain for user gui: 501\n")
-        for (queue, service) in [(ownedQueue, absentService), (CommandResult(status: 0, output: ""), loadedService),
-                                 (CommandResult(status: 0, output: "device for Evolis_Avansia: ipp://elsewhere.invalid/ipp/print\n"), loadedService)] {
+        for (queue, service) in [(ownedQueue, absentService), (CommandResult(status: 0, output: #"{"exists":false,"device_uri":null}"#), loadedService),
+                                 (CommandResult(status: 0, output: #"{"exists":true,"device_uri":"ipp://elsewhere.invalid/ipp/print"}"#), loadedService),
+                                 (CommandResult(status: 0, output: #"{"exists":true,"device_uri":null}"#), loadedService)] {
             await probeRunner.configure(queue: queue, service: service)
             await installation.refreshInstallation()
             try expect(installation.installationState == .incomplete && !installation.canPrint && installation.canUninstall, "Incomplete or foreign-endpoint installation never enables Print")
         }
+        let malformedQueueResponses = ["", "not JSON", "{}", #"{"exists":1,"device_uri":null}"#,
+                                       #"{"exists":"false","device_uri":null}"#, #"{"exists":false}"#,
+                                       #"{"exists":true,"device_uri":42}"#,
+                                       #"{"exists":false,"device_uri":"ipp://localhost:18631/ipp/print"}"#,
+                                       "\u{7528}\u{4E8E}Evolis_Avansia\u{7684}\u{8BBE}\u{5907}\u{FF1A}ipp://localhost:18631/ipp/print"]
+        for output in malformedQueueResponses {
+            await probeRunner.configure(queue: CommandResult(status: 0, output: output), service: loadedService)
+            let beforeMalformed = await probeRunner.history().count
+            await installation.refreshInstallation()
+            let afterMalformed = await probeRunner.history().count
+            try expect(installation.installationState == .unknown && !installation.canPrint && !installation.canInstall && afterMalformed == beforeMalformed + 1,
+                       "Malformed or localized prose responses fail closed before service inspection")
+        }
+        await probeRunner.configure(queue: CommandResult(status: 1, output: #"{"exists":false,"device_uri":null}"#), service: absentService)
+        await installation.refreshInstallation()
+        try expect(installation.installationState == .unknown && !installation.canInstall && !installation.canPrint, "Nonzero queue-info status is an error even if stdout resembles clean absence")
         await probeRunner.configure(queue: ownedQueue, service: CommandResult(status: 113, output: "Could not find domain for user gui: 501\n"))
         await installation.refreshInstallation()
         try expect(installation.installationState == .unknown && !installation.canInstall && !installation.canPrint, "Query errors are not treated as clean absence")
@@ -171,7 +189,7 @@ actor InstallationCommandFixture: AppCommandRunning {
         let fixture = folder.appendingPathComponent("fixture.json")
         try write(["runtime_available": true, "snapshot": snapshot()], to: fixture)
         let preview = UtilityModel(base: folder.appendingPathComponent("absent"), package: package, fixture: fixture,
-                                   runner: probeRunner, installationProbe: AppInstallationProbe(runner: probeRunner))
+                                   runner: probeRunner, installationProbe: AppInstallationProbe(setup: package.appendingPathComponent("AvansiaSetup"), runner: probeRunner))
         preview.reloadCache(); preview.reloadCache()
         try expect(preview.runtimeAvailable && !preview.commandsAllowed, "Fixture mode remains stable and forbids live commands")
         let beforeFixtureProbe = await probeRunner.history().count
@@ -183,6 +201,6 @@ actor InstallationCommandFixture: AppCommandRunning {
             _ = try await NativeCommandRunner().run(helper, ["sleep"], timeout: 0.1)
             throw AppFailure.message("Test failed: timeout was accepted")
         } catch { try expect(error.localizedDescription.contains("timed out"), "Command timeout is reported") }
-        print("PASS: canonical C command locale under inherited Chinese environment, unchanged zh-Hans UI, retained-runtime installation separation, verified queue/service and endpoint, setup refresh, incomplete/error print gates, nonoverlapping read-only probes, fixture isolation, status/recovery/settings safety, responsive commands and timeouts")
+        print("PASS: explicit child environment (not an output-language guarantee), unchanged zh-Hans UI, structured native queue information, injected bundled Setup path, retained-runtime separation, verified endpoint/service, setup refresh, malformed/error print gates, nonoverlapping read-only probes, fixture isolation, status/recovery/settings safety, responsive commands and timeouts")
     }
 }

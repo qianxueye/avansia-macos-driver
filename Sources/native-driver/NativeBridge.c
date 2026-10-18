@@ -26,6 +26,49 @@ int avansia_interrupted(void) { return interrupted; }
 static int failure(char *error, size_t capacity, const char *message) {
     snprintf(error, capacity, "%s", message); return -1;
 }
+int avansia_queue_uri(const char *name, char *uri, size_t uri_capacity, char *error, size_t error_capacity) {
+    if (!name || !name[0] || !uri || !uri_capacity ||
+        strspn(name, "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-") != strlen(name))
+        return failure(error, error_capacity, "Invalid queue identity query");
+    uri[0] = '\0';
+    char resource[1024], printer_uri[1100];
+    if (snprintf(resource, sizeof(resource), "/printers/%s", name) >= (int)sizeof(resource))
+        return failure(error, error_capacity, "The queue name exceeds its buffer");
+    snprintf(printer_uri, sizeof(printer_uri), "ipp://localhost:631%s", resource);
+    http_t *http = httpConnect2("localhost", 631, NULL, AF_UNSPEC, HTTP_ENCRYPTION_IF_REQUESTED, 1, 2000, NULL);
+    if (!http) return failure(error, error_capacity, "Cannot connect to local CUPS to query the queue");
+    httpSetTimeout(http, 2.0, NULL, NULL);
+    ipp_t *request = ippNewRequest(IPP_OP_GET_PRINTER_ATTRIBUTES);
+    ippAddString(request, IPP_TAG_OPERATION, IPP_TAG_URI, "printer-uri", NULL, printer_uri);
+    const char *attributes[] = {"printer-name", "device-uri"};
+    ippAddStrings(request, IPP_TAG_OPERATION, IPP_TAG_KEYWORD, "requested-attributes", 2, NULL, attributes);
+    ipp_t *response = cupsDoRequest(http, request, resource);
+    int result = -1;
+    if (!response) failure(error, error_capacity, "Local CUPS did not return a queue identity response");
+    else if (ippGetStatusCode(response) == IPP_STATUS_ERROR_NOT_FOUND) result = 0;
+    else if (ippGetStatusCode(response) >= IPP_STATUS_ERROR_BAD_REQUEST)
+        failure(error, error_capacity, "Local CUPS rejected the queue identity query");
+    else {
+        ipp_attribute_t *device = NULL, *identity = NULL;
+        int devices = 0, identities = 0;
+        for (ipp_attribute_t *attribute = ippFirstAttribute(response); attribute; attribute = ippNextAttribute(response)) {
+            const char *attribute_name = ippGetName(attribute);
+            if (attribute_name && !strcmp(attribute_name, "device-uri")) { device = attribute; ++devices; }
+            if (attribute_name && !strcmp(attribute_name, "printer-name")) { identity = attribute; ++identities; }
+        }
+        const char *value = devices == 1 && ippGetGroupTag(device) == IPP_TAG_PRINTER &&
+            ippGetValueTag(device) == IPP_TAG_URI && ippGetCount(device) == 1 ? ippGetString(device, 0, NULL) : NULL;
+        const char *found_name = identities == 1 && ippGetGroupTag(identity) == IPP_TAG_PRINTER &&
+            ippGetValueTag(identity) == IPP_TAG_NAME && ippGetCount(identity) == 1 ? ippGetString(identity, 0, NULL) : NULL;
+        if (!found_name || strcmp(found_name, name)) failure(error, error_capacity, "Local CUPS returned an inconsistent printer-name attribute");
+        else if (!value || !value[0]) failure(error, error_capacity, "Local CUPS returned an incomplete device-uri attribute");
+        else if (strlen(value) >= uri_capacity) failure(error, error_capacity, "The queue device-uri exceeds its buffer");
+        else { memcpy(uri, value, strlen(value) + 1); result = 1; }
+    }
+    if (response) ippDelete(response);
+    httpClose(http);
+    return result;
+}
 int avansia_job_cancelled(const char *uri, char *error, size_t capacity) {
     char scheme[32], user[256], host[256], resource[1024];
     int port = 0;

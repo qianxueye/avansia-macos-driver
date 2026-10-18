@@ -25,22 +25,30 @@ struct AppInstallationResult {
     let details: String
 }
 struct AppInstallationProbe {
+    private struct QueueInformation: Decodable {
+        let exists: Bool
+        let device_uri: String?
+        enum CodingKeys: String, CodingKey { case exists, device_uri }
+        init(from decoder: Decoder) throws {
+            let values = try decoder.container(keyedBy: CodingKeys.self)
+            exists = try values.decode(Bool.self, forKey: .exists)
+            if try values.decodeNil(forKey: .device_uri) { device_uri = nil }
+            else { device_uri = try values.decode(String.self, forKey: .device_uri) }
+            guard exists || device_uri == nil else { throw AppFailure.message("Queue information contradicts its absence flag") }
+        }
+    }
+    private let setup: URL
     private let runner: any AppCommandRunning
-    init(runner: any AppCommandRunning = NativeCommandRunner()) { self.runner = runner }
+    init(setup: URL, runner: any AppCommandRunning = NativeCommandRunner()) { self.setup = setup; self.runner = runner }
     func inspect() async -> AppInstallationResult {
-        let name = "Evolis_Avansia"
         let endpoint = "ipp://localhost:18631/ipp/print"
         let service = "local.avansia.ipp"
         do {
-            let queueResult = try await runner.run(URL(fileURLWithPath: "/usr/bin/lpstat"), ["-v"], timeout: 4, progress: { _ in })
+            let queueResult = try await runner.run(setup, ["queue-info"], timeout: 4, progress: { _ in })
             guard queueResult.status == 0 else {
-                return AppInstallationResult(state: .unknown, details: "Queue inspection failed (lpstat exit \(queueResult.status)).")
+                return AppInstallationResult(state: .unknown, details: "Queue inspection failed (Setup exit \(queueResult.status)).")
             }
-            let queueEndpoint = queueResult.output.split(separator: "\n").compactMap { line -> String? in
-                guard let separator = line.firstIndex(of: ":"),
-                      line[..<separator].split(whereSeparator: { $0.isWhitespace }).last == Substring(name) else { return nil }
-                return String(line[line.index(after: separator)...]).trimmingCharacters(in: .whitespaces)
-            }.first
+            let queue = try JSONDecoder().decode(QueueInformation.self, from: Data(queueResult.output.utf8))
             let serviceResult = try await runner.run(URL(fileURLWithPath: "/bin/launchctl"), ["print", "gui/\(getuid())/" + service], timeout: 4, progress: { _ in })
             let servicePresent: Bool
             if serviceResult.status == 0 { servicePresent = true }
@@ -48,10 +56,10 @@ struct AppInstallationProbe {
             else {
                 return AppInstallationResult(state: .unknown, details: "Service inspection failed (launchctl exit \(serviceResult.status)).")
             }
-            let queueOwned = queueEndpoint == endpoint
+            let queueOwned = queue.exists && queue.device_uri == endpoint
             let state: AppInstallationState = queueOwned && servicePresent ? .installed
-                : queueEndpoint == nil && !servicePresent ? .notInstalled : .incomplete
-            let details = "Queue Evolis_Avansia: " + (queueEndpoint ?? "absent")
+                : !queue.exists && !servicePresent ? .notInstalled : .incomplete
+            let details = "Queue Evolis_Avansia: " + (queue.exists ? queue.device_uri ?? "present; endpoint unavailable" : "absent")
                 + "\nUser service local.avansia.ipp: " + (servicePresent ? "loaded" : "absent")
             return AppInstallationResult(state: state, details: details)
         } catch {
