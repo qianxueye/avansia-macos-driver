@@ -141,7 +141,7 @@ final class DeviceMenu {
                 result.settings.append(DiscoveredSetting(descriptor:menu,group:group,rule:rule,ordinal:result.settings.count))
             }
         }
-        guard let user=try root("USER","User Mode") else { throw Failure("USER menu root is unavailable") }
+        guard let user=try root("USER","User Mode") else { throw DeviceMetadataUnavailable(description:"USER menu root is unavailable") }
         try visit(user,"",0)
         if let service=try root("SERV","Service Mode"), let setupSelector=try service.child(["Printer Setup"]) {
             let setup=try get(setupSelector)

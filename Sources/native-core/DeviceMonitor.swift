@@ -5,6 +5,12 @@ import Darwin
 struct DeviceAccessFailure:Error,CustomStringConvertible {
     let connection:String, description:String
 }
+struct DeviceMetadataUnavailable:Error,CustomStringConvertible {
+    let description:String
+}
+struct DeviceStateFailure:Error,CustomStringConvertible {
+    let state:[String:Any], description:String
+}
 struct SettingFailure:Error,CustomStringConvertible {
     let description:String, writeAttempted:Bool, refreshRequired:Bool
 }
@@ -103,7 +109,9 @@ final class DeviceManager {
         return current
     }
     func ready(_ state:[String:Any]) throws {
-        try require(state["ready"] as? Bool==true && state["printing"] as? Bool==false && state["error"] as? Bool==false && state["mechanical_busy"] as? Bool != true && state["interface_busy"] as? Bool != true,"The printer must be Ready, idle and error-free")
+        guard state["ready"] as? Bool==true && state["printing"] as? Bool==false && state["error"] as? Bool==false && state["mechanical_busy"] as? Bool != true && state["interface_busy"] as? Bool != true else {
+            throw DeviceStateFailure(state:state,description:"The printer must be Ready, idle and error-free")
+        }
     }
     func reconcileSetting(_ state:[String:Any],_ discovery:MenuDiscovery) throws -> [String:Any]? {
         guard store.settingUncertain else { return nil }
@@ -191,33 +199,52 @@ final class DeviceManager {
         }
     }
     func snapshot(refreshDetails:Bool=false) throws -> [String:Any] {
-        var current:[String:Any]=["active_job":false,"recovery_required":false]
-        do {
+        var current:[String:Any]=["active_job":NSNull(),"recovery_required":NSNull()]
+        var hardware:[String:Any]?
+        func observeQueue() throws {
+            current=["active_job":NSNull(),"recovery_required":NSNull()]
             current=try queue()
+        }
+        func checkIdle() throws {
+            try observeQueue()
+            try require(current["active_job"] as? Bool==false && current["recovery_required"] as? Bool==false,"A pending, active or uncertain card prevents device access")
+        }
+        do {
+            try observeQueue()
             if current["recovery_required"] as? Bool==true || current["active_job"] as? Bool==true {
                 return try updateStatus(nil,connection:current["recovery_required"] as? Bool==true ? "recovery" : "busy",stale:true,queue:current)
             }
-            let transport=try factory(); _=try idle()
-            let hardware=try transport.status()
+            let transport=try factory(); try checkIdle()
+            hardware=try transport.status()
             var details:MenuDiscovery?, identity:[String:Any]?, detailError:String?, resolution:[String:Any]?
             if refreshDetails {
-                do {
-                    try ready(hardware); _=try idle()
-                    details=try DeviceMenu(transport).discover()
-                    _=try idle();let fresh=try transport.status();try ready(fresh)
-                    try require(fresh["serial"] as? String==hardware["serial"] as? String,"Printer changed during detail refresh")
-                    let ribbon=try transport.ribbonStatus();identity=ribbon["ribbon"] as? [String:Any]
-                    resolution=try reconcileSetting(fresh,details!)
-                } catch let error as DeviceAccessFailure { throw error }
-                catch { detailError=String(describing:error) }
+                try ready(hardware!); try checkIdle()
+                let serial=hardware!["serial"] as? String
+                do { details=try DeviceMenu(transport).discover() }
+                catch let error as DeviceMetadataUnavailable { detailError=error.description }
+                try checkIdle()
+                hardware=try transport.status(); try ready(hardware!)
+                try require(hardware!["serial"] as? String==serial,"Printer changed during detail refresh")
+                try checkIdle()
+                var ribbon:[String:Any]?
+                do { ribbon=try transport.ribbonStatus() }
+                catch let error as DeviceMetadataUnavailable { detailError=error.description }
+                if let ribbon {
+                    var observed=ribbon
+                    observed.removeValue(forKey:"ribbon");observed.removeValue(forKey:"detected_ribbon")
+                    hardware=observed; try ready(observed)
+                    try require(observed["serial"] as? String==serial,"Printer changed during ribbon detail refresh")
+                    try checkIdle()
+                    identity=ribbon["ribbon"] as? [String:Any]
+                }
+                if let details { resolution=try reconcileSetting(hardware!,details) }
             }
-            return try updateStatus(hardware,connection:connection(hardware),stale:false,queue:current,error:detailError,details:details,ribbonIdentity:identity,settingResolution:resolution)
+            return try updateStatus(hardware,connection:connection(hardware!),stale:false,queue:current,error:detailError,details:details,ribbonIdentity:identity,settingResolution:resolution)
         } catch {
-            let latest=(try? queue()) ?? current
-            let message=String(describing:error)
-            let failure=(error as? DeviceAccessFailure)?.connection ?? (message.contains("USB read failed: -4;") || message.contains("USB write failed: -4;") ? "disconnected" : message.contains("USB") || message.contains("response") ? "error" : "unknown")
-            let state=latest["recovery_required"] as? Bool==true ? "recovery" : latest["active_job"] as? Bool==true ? "busy" : failure
-            return try updateStatus(nil,connection:state,stale:true,queue:latest,error:String(describing:error))
+            if let observation=error as? DeviceStateFailure { hardware=observation.state }
+            let transportFailure=error as? DeviceAccessFailure
+            let state=current["recovery_required"] as? Bool==true ? "recovery" : current["active_job"] as? Bool==true ? "busy" : current["active_job"] as? Bool != false ? "unknown" : transportFailure?.connection ?? hardware.map{connection($0)} ?? "error"
+            return try updateStatus(transportFailure==nil ? hardware : nil,connection:state,stale:true,queue:current,error:String(describing:error))
         }
     }
     func settings() throws -> [String:Any] {

@@ -19,8 +19,10 @@ final class SyntheticDevice:DeviceTransport {
     var nodes:[String:[UInt8]]=[:], replies:[[UInt8]]=[], writes:[[UInt8]]=[]
     var statusCalls=0, ribbonCalls=0, failWrite=false, badACK=false, ignoreWrite=false, wrongHeader=false
     var beforeStatus:(() -> Void)?
+    var afterRequest:(() throws -> Void)?
     var readFailure:DeviceAccessFailure?, ribbonFailure:Error?
     var statusPayload:([UInt8],[UInt8])?
+    var ribbonObservation:[String:Any]?
     init() {
         nodes["USER"]=syntheticMenu(1,"",1,extra:syntheticChild("User Mode",2))
         nodes["SERV"]=syntheticMenu(11,"",1,extra:syntheticChild("User Mode",2)+syntheticChild("Service Mode",12))
@@ -37,7 +39,7 @@ final class SyntheticDevice:DeviceTransport {
         nodes["14"]=syntheticMenu(14,"Print Quality Bk",3,0,1,1,extra:syntheticChoice("HIGH SPEED")+syntheticChoice("HIGH QUALITY"))
     }
     func write(_ data:[UInt8],timeout:UInt32) throws {
-        writes.append(data)
+        writes.append(data);try afterRequest?()
         if data[1]==0x4f {
             if failWrite { throw Failure("Injected partial write") }
             try coreCheck(data.count==33 && Array(data.prefix(6))==[28,79,0,0,0,27],"One exact O header")
@@ -60,7 +62,7 @@ final class SyntheticDevice:DeviceTransport {
         return value
     }
     func status() throws -> [String:Any] { statusCalls+=1;beforeStatus?();if let statusPayload { return try decodeDeviceStatus(statusPayload.0,statusPayload.1) };return state }
-    func ribbonStatus() throws -> [String:Any] { ribbonCalls+=1;if let ribbonFailure { throw ribbonFailure };return ["ribbon":["code":"TEST-RIBBON","label":"Synthetic YMCK","zone":"TEST"]] }
+    func ribbonStatus() throws -> [String:Any] { ribbonCalls+=1;if let ribbonFailure { throw ribbonFailure };var result=ribbonObservation ?? state;result["ribbon"]=["code":"TEST-RIBBON","label":"Synthetic YMCK","zone":"TEST"];return result }
     var writeCount:Int { writes.filter{$0[1]==0x4f}.count }
 }
 @main struct CoreTests {
@@ -136,10 +138,63 @@ final class SyntheticDevice:DeviceTransport {
         let coldMonitor=DeviceManager(base:temporary.appendingPathComponent("cold-detail-failure"),factory:{coldFailure},pending:{false})
         let cold=try coldMonitor.snapshot(refreshDetails:true)
         try coreCheck(cold["observed_at"] is NSNull && cold["stale"] as? Bool==true && cold["connection"] as? String=="disconnected","Initial Ready must not become an observation after detail transport fails")
-        let metadata=SyntheticDevice();metadata.ribbonFailure=Failure("Ribbon metadata is unavailable")
+        let metadata=SyntheticDevice();metadata.ribbonFailure=DeviceMetadataUnavailable(description:"Ribbon metadata is unavailable")
         let metadataMonitor=DeviceManager(base:temporary.appendingPathComponent("metadata-unavailable"),factory:{metadata},pending:{false})
         let metadataState=try metadataMonitor.snapshot(refreshDetails:true)
         try coreCheck(metadataState["connection"] as? String=="ready" && metadataState["stale"] as? Bool==false && metadataState["error"] as? String=="Ribbon metadata is unavailable","Metadata unavailability is distinct from transport failure")
+        for stage in ["initial-busy","initial-error","post-menu-busy","post-menu-error","post-menu-mechanical","post-menu-interface","post-menu-printing","post-menu-swap","rfid-entry-busy","rfid-exit-error","rfid-result-busy","rfid-result-swap"] {
+            let device=SyntheticDevice(), monitor=DeviceManager(base:temporary.appendingPathComponent(stage),factory:{device},pending:{false})
+            let cached=try monitor.snapshot(refreshDetails:true), requests=device.writes.count
+            var changed=device.state
+            if stage.contains("swap") { changed["serial"]="SYN00002" }
+            else if stage.contains("error") { changed["ready"]=false;changed["error"]=true }
+            else if stage.contains("mechanical") { changed["mechanical_busy"]=true }
+            else if stage.contains("interface") { changed["interface_busy"]=true }
+            else if stage.contains("printing") { changed["printing"]=true }
+            else { changed["ready"]=false }
+            if stage.hasPrefix("initial-") { device.state=changed }
+            if stage.hasPrefix("post-menu-") { device.beforeStatus={ if device.statusCalls==4 { device.state=changed } } }
+            if stage=="rfid-entry-busy" || stage=="rfid-exit-error" { device.ribbonFailure=DeviceStateFailure(state:changed,description:"Observed state interrupted RFID details") }
+            if stage.hasPrefix("rfid-result-") { device.ribbonObservation=changed }
+            let interrupted=try monitor.snapshot(refreshDetails:true)
+            let observed=interrupted["device"] as! [String:Any]
+            try coreCheck(interrupted["stale"] as? Bool==true && observed["serial"] as? String==changed["serial"] as? String,"Interrupted details must retain the latest observed device identity")
+            try coreCheck(interrupted["connection"] as? String==monitor.connection(changed),"Busy/error detail observations must replace initial Ready")
+            if stage.contains("swap") {
+                try coreCheck((interrupted["accessories"] as! [[String:Any]]).isEmpty && (interrupted["ribbon"] as! [String:Any])["reference"]==nil && interrupted["details_observed_at"] is NSNull,"Replacement must not receive old-device metadata")
+            } else {
+                try coreCheck(interrupted["details_observed_at"] as? String==cached["details_observed_at"] as? String,"Interrupted refresh must not advance metadata timestamp")
+            }
+            if stage.hasPrefix("initial-") { try coreCheck(device.writes.count==requests && device.statusCalls==3 && device.ribbonCalls==1,"Initial nonready state prevents all menu/RFID traffic") }
+            else if stage.hasPrefix("post-menu-") { try coreCheck(device.statusCalls==4 && device.ribbonCalls==1,"Post-menu state interruption prevents RFID and further status queries") }
+            else { try coreCheck(device.statusCalls==4 && device.ribbonCalls==2,"RFID observation failure must not trigger a confirmation status query") }
+            try coreCheck(device.writeCount==0,"State changes never issue setting writes")
+        }
+        for stage in ["before-menu","during-menu","after-status","after-rfid","recovery","queue-unavailable"] {
+            let device=SyntheticDevice(), root=temporary.appendingPathComponent("queue-race-"+stage)
+            var armed=false, requests=0
+            let monitor=DeviceManager(base:root,factory:{device},pending:{
+                if !armed { return false }
+                let arrived=stage=="before-menu" ? device.statusCalls>=3 : stage=="after-status" ? device.statusCalls>=4 : stage=="after-rfid" ? device.ribbonCalls>=2 : device.writes.count>requests
+                if arrived && stage=="queue-unavailable" { throw Failure("Injected local scheduler query failure") }
+                return arrived && stage != "recovery"
+            })
+            device.afterRequest={
+                if armed && stage=="recovery" { try Data().write(to:root.appendingPathComponent("state/inflight.json")) }
+            }
+            let cached=try monitor.snapshot(refreshDetails:true);requests=device.writes.count;armed=true
+            let interrupted=try monitor.snapshot(refreshDetails:true), queue=interrupted["queue"] as! [String:Any]
+            try coreCheck(interrupted["stale"] as? Bool==true && interrupted["details_observed_at"] as? String==cached["details_observed_at"] as? String,"Queue interruption prevents publishing new metadata")
+            if stage=="queue-unavailable" {
+                try coreCheck(interrupted["connection"] as? String=="unknown" && queue["active_job"] is NSNull,"Failed queue query cannot assert verified idle")
+            } else if stage=="recovery" {
+                try coreCheck(interrupted["connection"] as? String=="recovery" && queue["recovery_required"] as? Bool==true,"New uncertainty marker must override Ready")
+            } else { try coreCheck(interrupted["connection"] as? String=="busy" && queue["active_job"] as? Bool==true,"New job must replace old empty queue and Ready state") }
+            if stage=="before-menu" { try coreCheck(device.writes.count==requests && device.statusCalls==3,"Queue arrival before menu must prevent metadata requests") }
+            if ["during-menu","queue-unavailable","recovery"].contains(stage) { try coreCheck(device.statusCalls==3 && device.ribbonCalls==1,"Queue interruption after menu prevents status/RFID follow-up") }
+            if stage=="after-status" { try coreCheck(device.statusCalls==4 && device.ribbonCalls==1,"Queue arrival before RFID prevents RFID") }
+            if stage=="after-rfid" { try coreCheck(device.statusCalls==4 && device.ribbonCalls==2,"Queue arrival after RFID prevents further detail traffic") }
+        }
         fake.state["serial"]="SYN00002"
         let replaced=try manager.snapshot()
         try coreCheck((replaced["ribbon"] as! [String:Any])["reference"]==nil && (replaced["accessories"] as! [[String:Any]]).isEmpty,"Printer change invalidates identity")

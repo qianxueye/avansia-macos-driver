@@ -69,8 +69,8 @@ printer serial, descriptor identity/type/range and expected current value;
 write once and require exact
 fresh readback. An uncertain result requires explicit refresh before another
 attempt. Service actions, firmware, movement and unknown fields are not generic
-write targets. A verified black-quality descriptor may be added as one explicit
-typed setting after its read protocol is established.
+write targets. The verified black-quality choice is exposed as one explicit
+typed setting.
 
 ## Packaging and licensing
 

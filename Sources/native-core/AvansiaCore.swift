@@ -224,7 +224,7 @@ final class USB {
     }
     func ribbonStatus() throws -> [String: Any] {
         let state = try status(), flags = Int(state["flags"] as! String, radix: 16)!
-        try require(state["ready"] as? Bool == true && flags & 0x2a == 0, "The printer must be idle and Ready to read ribbon details")
+        guard state["ready"] as? Bool == true && flags & 0x2a == 0 else { throw DeviceStateFailure(state:state,description:"The printer must be idle and Ready to read ribbon details") }
         var details: [String: String] = [:], activeError: Error?
         do {
             try send(80, Array("\u{1b}E6,4.".utf8)); try send(67, [0,0,2,5]); usleep(60000)
@@ -253,7 +253,14 @@ final class USB {
             throw error
         }
         if let activeError { throw activeError }
-        var result = try status(); result["ribbon"] = details
+        var result = try status()
+        guard result["ready"] as? Bool==true && result["printing"] as? Bool==false && result["error"] as? Bool==false && result["mechanical_busy"] as? Bool != true && result["interface_busy"] as? Bool != true else {
+            throw DeviceStateFailure(state:result,description:"Printer became unavailable during ribbon detail refresh")
+        }
+        guard result["serial"] as? String==state["serial"] as? String else {
+            throw DeviceStateFailure(state:result,description:"Printer changed during ribbon detail refresh")
+        }
+        result["ribbon"] = details
         result["detected_ribbon"] = details["label"] == "Color YMCK RT" ? "YMCK" : details["label"] == "Color YMCKK RT" ? "YMCKK" as Any : NSNull()
         return result
     }
