@@ -1,0 +1,6 @@
+build/
+Vendor/
+.DS_Store
+.swiftpm/
+*.xcuserstate
+local-overrides.json

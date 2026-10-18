@@ -1,0 +1,11 @@
+--- a/cups/tls-darwin.c
++++ b/cups/tls-darwin.c
+@@ -1266,7 +1266,7 @@
+     DEBUG_puts("4_httpTLSStart: SSLCreateContext failed.");
+     http->error  = errno = ENOMEM;
+     http->status = HTTP_STATUS_ERROR;
+-    _cupsSetHTTPError(HTTP_STATUS_ERROR);
++    _cupsSetHTTPError(http, HTTP_STATUS_ERROR);
+ 
+     return (-1);
+   }

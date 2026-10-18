@@ -1,0 +1,10 @@
+--- a/tools/ippeveprinter.c
++++ b/tools/ippeveprinter.c
+@@ -556,7 +556,6 @@
+ 	        usage(1);
+ 
+ 	      docformats = _cupsArrayNewStrings(argv[i], ',');
+-	      legacy     = 1;
+ 	      break;
+ 
+ 	  case 'i' : /* -i icon.png */

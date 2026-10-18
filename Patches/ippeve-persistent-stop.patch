@@ -1,0 +1,787 @@
+--- a/tools/ippeveprinter.c
++++ b/tools/ippeveprinter.c
+@@ -179,6 +179,7 @@
+ {
+   cups_array_t		*ra;		/* Requested attributes */
+   ipp_tag_t		group_tag;	/* Group to copy */
++  int                   failed;
+ } ippeve_filter_t;
+ 
+ typedef struct ippeve_job_s ippeve_job_t;
+@@ -273,9 +274,14 @@
+  */
+ 
+ static http_status_t	authenticate_request(ippeve_client_t *client);
++static int              checkpoint_job(ippeve_job_t *job);
++static int              restore_job(ippeve_printer_t *printer);
++static int              clear_checkpoint(ippeve_printer_t *printer);
++static void             stop_job(ippeve_job_t *job);
+ static void		clean_jobs(ippeve_printer_t *printer);
+ static int		compare_jobs(ippeve_job_t *a, ippeve_job_t *b);
+-static void		copy_attributes(ipp_t *to, ipp_t *from, cups_array_t *ra, ipp_tag_t group_tag, int quickcopy);
++static int              clone_collection_cb(int *failed, ipp_t *dst, ipp_attribute_t *attr);
++static int              copy_attributes(ipp_t *to, ipp_t *from, cups_array_t *ra, ipp_tag_t group_tag);
+ static void		copy_job_attributes(ippeve_client_t *client, ippeve_job_t *job, cups_array_t *ra);
+ static ippeve_client_t	*create_client(ippeve_printer_t *printer, int sock);
+ static ippeve_job_t	*create_job(ippeve_client_t *client);
+@@ -845,6 +851,151 @@
+ 
+ 
+ /*
++ * Persist the active identity before invoking a command. A restored job is
++ * always stopped: an interrupted physical operation must never be replayed.
++ */
++
++static int
++checkpoint_job(ippeve_job_t *job)
++{
++  ipp_t *record = ippNew();
++  char path[1024], temp[1024];
++  int fd, result = 0;
++
++  ippSetRequestId(record, 1);
++  ippAddInteger(record, IPP_TAG_OPERATION, IPP_TAG_INTEGER, "checkpoint-next-id", job->printer->next_job_id);
++  ippAddInteger(record, IPP_TAG_OPERATION, IPP_TAG_INTEGER, "checkpoint-impressions", job->impressions);
++  ippAddInteger(record, IPP_TAG_OPERATION, IPP_TAG_INTEGER, "checkpoint-completed", job->impcompleted);
++  ippAddDate(record, IPP_TAG_OPERATION, "checkpoint-processing", ippTimeToDate(job->processing));
++  ippAddString(record, IPP_TAG_OPERATION, IPP_TAG_TEXT, "checkpoint-message", NULL,
++               job->message ? job->message : "Job interrupted; explicit cancellation is required before another job.");
++  if (job->filename)
++    ippAddString(record, IPP_TAG_OPERATION, IPP_TAG_NAME, "checkpoint-filename", NULL, strrchr(job->filename, '/') + 1);
++  if (!copy_attributes(record, job->attrs, NULL, IPP_TAG_JOB))
++  {
++    ippDelete(record);
++    return (0);
++  }
++  snprintf(path, sizeof(path), "%s/active-job.ipp", job->printer->directory);
++  snprintf(temp, sizeof(temp), "%s/active-job.tmp", job->printer->directory);
++  if (ippLength(record) <= 1024 * 1024 &&
++      (fd = open(temp, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0600)) >= 0)
++  {
++    result = ippWriteFile(fd, record) == IPP_STATE_DATA && !fsync(fd);
++    if (close(fd)) result = 0;
++    if (result) result = !rename(temp, path);
++    if (result && (fd = open(job->printer->directory, O_RDONLY)) >= 0)
++    {
++      result = !fsync(fd);
++      close(fd);
++    }
++    else result = 0;
++  }
++  ippDelete(record);
++  return (result);
++}
++
++static int
++clear_checkpoint(ippeve_printer_t *printer)
++{
++  char path[1024];
++  int fd, result;
++
++  snprintf(path, sizeof(path), "%s/active-job.ipp", printer->directory);
++  if (unlink(path) && errno != ENOENT) return (0);
++  if ((fd = open(printer->directory, O_RDONLY)) < 0) return (0);
++  result = !fsync(fd);
++  close(fd);
++  return (result);
++}
++
++static void
++stop_job(ippeve_job_t *job)
++{
++  job->state = IPP_JSTATE_STOPPED;
++  job->completed = 0;
++  job->printer->state = IPP_PSTATE_STOPPED;
++  job->printer->state_reasons |= IPPEVE_PREASON_OTHER;
++  job->printer->state_time = time(NULL);
++  if (!job->message)
++    job->message = strdup("Print command failed; explicit cancellation is required before another job.");
++}
++
++static int
++restore_job(ippeve_printer_t *printer)
++{
++  char path[1024];
++  int fd, next_id;
++  struct stat info;
++  ipp_t *record;
++  ipp_attribute_t *attr;
++  ippeve_job_t *job;
++
++  if (chmod(printer->directory, 0700)) return (0);
++  snprintf(path, sizeof(path), "%s/active-job.ipp", printer->directory);
++  if ((fd = open(path, O_RDONLY | O_NOFOLLOW)) < 0) return (errno == ENOENT);
++  record = ippNew();
++  if (fstat(fd, &info) || !S_ISREG(info.st_mode) || info.st_size > 1024 * 1024 ||
++      ippReadFile(fd, record) != IPP_STATE_DATA)
++  {
++    close(fd);
++    ippDelete(record);
++    return (0);
++  }
++  close(fd);
++  attr = ippFindAttribute(record, "job-id", IPP_TAG_INTEGER);
++  next_id = ippGetInteger(ippFindAttribute(record, "checkpoint-next-id", IPP_TAG_INTEGER), 0);
++  if (!attr || ippGetInteger(attr, 0) < 1 || next_id <= ippGetInteger(attr, 0))
++  {
++    ippDelete(record);
++    return (0);
++  }
++  job = calloc(1, sizeof(ippeve_job_t));
++  if (!job) { ippDelete(record); return (0); }
++  job->printer = printer;
++  job->fd = -1;
++  job->attrs = ippNew();
++  if (!copy_attributes(job->attrs, record, NULL, IPP_TAG_JOB))
++  {
++    delete_job(job);
++    ippDelete(record);
++    return (0);
++  }
++  job->id = ippGetInteger(attr, 0);
++  job->name = ippGetString(ippFindAttribute(job->attrs, "job-name", IPP_TAG_NAME), 0, NULL);
++  job->username = ippGetString(ippFindAttribute(job->attrs, "job-originating-user-name", IPP_TAG_NAME), 0, NULL);
++  job->format = "application/pdf";
++  job->created = ippDateToTime(ippGetDate(ippFindAttribute(job->attrs, "date-time-at-creation", IPP_TAG_DATE), 0));
++  job->processing = ippDateToTime(ippGetDate(ippFindAttribute(record, "checkpoint-processing", IPP_TAG_DATE), 0));
++  job->impressions = ippGetInteger(ippFindAttribute(record, "checkpoint-impressions", IPP_TAG_INTEGER), 0);
++  job->impcompleted = ippGetInteger(ippFindAttribute(record, "checkpoint-completed", IPP_TAG_INTEGER), 0);
++  attr = ippFindAttribute(record, "checkpoint-message", IPP_TAG_TEXT);
++  if (attr) job->message = strdup(ippGetString(attr, 0, NULL));
++  attr = ippFindAttribute(record, "checkpoint-filename", IPP_TAG_NAME);
++  if (attr)
++  {
++    const char *basename = ippGetString(attr, 0, NULL);
++    char prefix[32];
++    snprintf(prefix, sizeof(prefix), "%d-", job->id);
++    if (!basename || strncmp(basename, prefix, strlen(prefix)) || strchr(basename, '/') || strstr(basename, ".."))
++    {
++      delete_job(job);
++      ippDelete(record);
++      return (0);
++    }
++    snprintf(path, sizeof(path), "%s/%s", printer->directory, basename);
++    job->filename = strdup(path);
++  }
++  printer->next_job_id = next_id;
++  cupsArrayAdd(printer->jobs, job);
++  printer->active_job = job;
++  stop_job(job);
++  ippDelete(record);
++  return (1);
++}
++
++
++/*
+  * 'clean_jobs()' - Clean out old (completed) jobs.
+  */
+ 
+@@ -891,20 +1042,50 @@
+  * 'copy_attributes()' - Copy attributes from one request to another.
+  */
+ 
+-static void
+-copy_attributes(ipp_t        *to,	/* I - Destination request */
+-	        ipp_t        *from,	/* I - Source request */
+-	        cups_array_t *ra,	/* I - Requested attributes */
+-	        ipp_tag_t    group_tag,	/* I - Group to copy */
+-	        int          quickcopy)	/* I - Do a quick copy? */
++/* Collections have mutable serialization cursors, so responses need independent
++ * nested values even when the source attributes are otherwise immutable. */
++static int
++clone_collection_cb(int *failed, ipp_t *dst, ipp_attribute_t *attr)
+ {
+-  ippeve_filter_t	filter;			/* Filter data */
+-
+-
+-  filter.ra        = ra;
++  ipp_attribute_t *copy = NULL;
++  int i;
++
++  if (ippGetValueTag(attr) != IPP_TAG_BEGIN_COLLECTION) return (1);
++  for (i = 0; i < ippGetCount(attr); i ++)
++  {
++    ipp_t *child = ippNew();
++    if (!child || !ippCopyAttributes(child, ippGetCollection(attr, i), 0,
++                                    (ipp_copycb_t)clone_collection_cb, failed) || *failed)
++    {
++      ippDelete(child);
++      *failed = 1;
++      return (0);
++    }
++    if (!i)
++      copy = ippAddCollection(dst, ippGetGroupTag(attr), ippGetName(attr), child);
++    else if (!ippSetCollection(dst, &copy, i, child))
++      *failed = 1;
++    ippDelete(child);
++    if (!copy || *failed)
++    {
++      *failed = 1;
++      return (0);
++    }
++  }
++  return (0);
++}
++
++static int
++copy_attributes(ipp_t *to, ipp_t *from, cups_array_t *ra, ipp_tag_t group_tag)
++{
++  ippeve_filter_t filter;
++  int result;
++
++  filter.ra = ra;
+   filter.group_tag = group_tag;
+-
+-  ippCopyAttributes(to, from, quickcopy, (ipp_copycb_t)filter_cb, &filter);
++  filter.failed = 0;
++  result = ippCopyAttributes(to, from, 0, (ipp_copycb_t)filter_cb, &filter);
++  return (result && !filter.failed);
+ }
+ 
+ 
+@@ -918,7 +1099,11 @@
+     ippeve_job_t    *job,			/* I - Job */
+     cups_array_t  *ra)			/* I - requested-attributes */
+ {
+-  copy_attributes(client->response, job->attrs, ra, IPP_TAG_JOB, 0);
++  if (!copy_attributes(client->response, job->attrs, ra, IPP_TAG_JOB))
++  {
++    respond_ipp(client, IPP_STATUS_ERROR_INTERNAL, "Unable to copy job attributes.");
++    return;
++  }
+ 
+   if (!ra || cupsArrayFind(ra, "date-time-at-completed"))
+   {
+@@ -1036,7 +1221,7 @@
+       case IPP_JSTATE_STOPPED :
+ 	  ippAddString(client->response, IPP_TAG_JOB,
+ 	               IPP_CONST_TAG(IPP_TAG_KEYWORD), "job-state-reasons",
+-		       NULL, "job-stopped");
++		       NULL, "printer-stopped");
+ 	  break;
+ 
+       case IPP_JSTATE_CANCELED :
+@@ -1159,7 +1344,12 @@
+   * Copy all of the job attributes...
+   */
+ 
+-  copy_attributes(job->attrs, client->request, NULL, IPP_TAG_JOB, 0);
++  if (!copy_attributes(job->attrs, client->request, NULL, IPP_TAG_JOB))
++  {
++    delete_job(job);
++    _cupsRWUnlock(&(client->printer->rwlock));
++    return (NULL);
++  }
+ 
+  /*
+   * Get the requesting-user-name, document format, and priority...
+@@ -1219,6 +1409,12 @@
+ 
+   ippAddInteger(job->attrs, IPP_TAG_JOB, IPP_TAG_INTEGER, "time-at-creation", (int)(job->created - client->printer->start_time));
+ 
++  if (!checkpoint_job(job))
++  {
++    delete_job(job);
++    _cupsRWUnlock(&(client->printer->rwlock));
++    return (NULL);
++  }
+   cupsArrayAdd(client->printer->jobs, job);
+   client->printer->active_job = job;
+ 
+@@ -1240,6 +1436,7 @@
+     const char       *directory,	/* I - Directory to store in */
+     const char       *ext)		/* I - Extension (`NULL` for default) */
+ {
++  int document = ext == NULL;
+   char			name[256],	/* "Safe" filename */
+ 			*nameptr;	/* Pointer into filename */
+   const char		*job_name;	/* job-name value */
+@@ -1299,7 +1496,24 @@
+ 
+   snprintf(fname, fnamesize, "%s/%d-%s.%s", directory, job->id, name, ext);
+ 
+-  return (open(fname, O_WRONLY | O_CREAT | O_TRUNC | O_BINARY, 0666));
++  {
++    int fd = -1;
++    if (document)
++    {
++      _cupsRWLockWrite(&(job->printer->rwlock));
++      if (job->printer->active_job == job && job->state < IPP_JSTATE_CANCELED)
++      {
++        free(job->filename);
++        job->filename = strdup(fname);
++        if (checkpoint_job(job))
++          fd = open(fname, O_WRONLY | O_CREAT | O_TRUNC | O_BINARY, 0600);
++      }
++      _cupsRWUnlock(&(job->printer->rwlock));
++    }
++    else
++      fd = open(fname, O_WRONLY | O_CREAT | O_TRUNC | O_BINARY, 0600);
++    return (fd);
++  }
+ }
+ 
+ 
+@@ -2006,6 +2220,12 @@
+   * Register the printer with DNS-SD...
+   */
+ 
++  if (!restore_job(printer))
++  {
++    fprintf(stderr, "Unable to restore active-job checkpoint; refusing to accept jobs.\n");
++    goto bad_printer;
++  }
++
+   if (!register_printer(printer))
+     goto bad_printer;
+ 
+@@ -2332,17 +2552,14 @@
+   * Filter attributes as needed...
+   */
+ 
+-#ifndef _WIN32 /* Avoid MS compiler bug */
+-  (void)dst;
+-#endif /* !_WIN32 */
+-
+   ipp_tag_t group = ippGetGroupTag(attr);
+   const char *name = ippGetName(attr);
+ 
+   if ((filter->group_tag != IPP_TAG_ZERO && group != filter->group_tag && group != IPP_TAG_ZERO) || !name || (!strcmp(name, "media-col-database") && !cupsArrayFind(filter->ra, (void *)name)))
+     return (0);
+ 
+-  return (!filter->ra || cupsArrayFind(filter->ra, (void *)name) != NULL);
++  if (filter->ra && !cupsArrayFind(filter->ra, (void *)name)) return (0);
++  return (clone_collection_cb(&filter->failed, dst, attr));
+ }
+ 
+ 
+@@ -2460,7 +2677,7 @@
+   }
+ 
+   job->fd       = -1;
+-  job->filename = strdup(filename);
++  if (!job->filename) job->filename = strdup(filename);
+   job->state    = IPP_JSTATE_PENDING;
+ 
+  /*
+@@ -2475,8 +2692,17 @@
+   }
+   else
+   {
++    _cupsRWLockWrite(&(job->printer->rwlock));
++    if (job->printer->active_job == job)
++    {
++      free(job->message);
++      job->message = strdup("Unable to start job processing thread.");
++      stop_job(job);
++      checkpoint_job(job);
++    }
++    _cupsRWUnlock(&(job->printer->rwlock));
+     respond_ipp(client, IPP_STATUS_ERROR_INTERNAL, "Unable to process job.");
+-    goto abort_job;
++    return;
+   }
+ 
+  /*
+@@ -2492,7 +2718,9 @@
+   cupsArrayAdd(ra, "job-state-reasons");
+   cupsArrayAdd(ra, "job-uri");
+ 
++  _cupsRWLockWrite(&(client->printer->rwlock));
+   copy_job_attributes(client, job, ra);
++  _cupsRWUnlock(&(client->printer->rwlock));
+   cupsArrayDelete(ra);
+   return;
+ 
+@@ -2511,7 +2739,9 @@
+   cupsArrayAdd(ra, "job-state-reasons");
+   cupsArrayAdd(ra, "job-uri");
+ 
++  _cupsRWLockWrite(&(client->printer->rwlock));
+   copy_job_attributes(client, job, ra);
++  _cupsRWUnlock(&(client->printer->rwlock));
+   cupsArrayDelete(ra);
+ }
+ 
+@@ -2617,16 +2847,14 @@
+   * Create a file for the request data...
+   */
+ 
++  _cupsRWUnlock(&(client->printer->rwlock));
+   if ((job->fd = create_job_file(job, filename, sizeof(filename), client->printer->directory, NULL)) < 0)
+   {
+-    _cupsRWUnlock(&(client->printer->rwlock));
+ 
+     respond_ipp(client, IPP_STATUS_ERROR_INTERNAL, "Unable to create print file: %s", strerror(errno));
+ 
+     goto abort_job;
+   }
+-
+-  _cupsRWUnlock(&(client->printer->rwlock));
+ 
+   if (!strcmp(scheme, "file"))
+   {
+@@ -2752,7 +2980,7 @@
+   _cupsRWLockWrite(&(client->printer->rwlock));
+ 
+   job->fd       = -1;
+-  job->filename = strdup(filename);
++  if (!job->filename) job->filename = strdup(filename);
+   job->state    = IPP_JSTATE_PENDING;
+ 
+   _cupsRWUnlock(&(client->printer->rwlock));
+@@ -2775,7 +3003,9 @@
+   cupsArrayAdd(ra, "job-state-reasons");
+   cupsArrayAdd(ra, "job-uri");
+ 
++  _cupsRWLockWrite(&(client->printer->rwlock));
+   copy_job_attributes(client, job, ra);
++  _cupsRWUnlock(&(client->printer->rwlock));
+   cupsArrayDelete(ra);
+   return;
+ 
+@@ -2794,7 +3024,9 @@
+   cupsArrayAdd(ra, "job-state-reasons");
+   cupsArrayAdd(ra, "job-uri");
+ 
++  _cupsRWLockWrite(&(client->printer->rwlock));
+   copy_job_attributes(client, job, ra);
++  _cupsRWUnlock(&(client->printer->rwlock));
+   cupsArrayDelete(ra);
+ }
+ 
+@@ -3190,6 +3422,7 @@
+   * we can't cancel...
+   */
+ 
++  _cupsRWLockWrite(&(client->printer->rwlock));
+   switch (job->state)
+   {
+     case IPP_JSTATE_CANCELED :
+@@ -3212,22 +3445,36 @@
+         * Cancel the job...
+ 	*/
+ 
+-	_cupsRWLockWrite(&(client->printer->rwlock));
+-
++
++        if (client->printer->active_job != job)
++        {
++          respond_ipp(client, IPP_STATUS_ERROR_NOT_POSSIBLE, "Job is no longer active.");
++          break;
++        }
+ 	if (job->state == IPP_JSTATE_PROCESSING ||
+ 	    (job->state == IPP_JSTATE_HELD && job->fd >= 0))
+           job->cancel = 1;
+ 	else
+ 	{
+-	  job->state     = IPP_JSTATE_CANCELED;
+-	  job->completed = time(NULL);
++	  if (!clear_checkpoint(client->printer))
++          {
++            respond_ipp(client, IPP_STATUS_ERROR_INTERNAL, "Unable to clear active-job checkpoint.");
++            _cupsRWUnlock(&(client->printer->rwlock));
++            return;
++          }
++          job->state     = IPP_JSTATE_CANCELED;
++          job->completed = time(NULL);
++          if (job->filename && !KeepFiles) unlink(job->filename);
++          client->printer->active_job = NULL;
++          client->printer->state = IPP_PSTATE_IDLE;
++          client->printer->state_reasons &= (ippeve_preason_t)~IPPEVE_PREASON_OTHER;
+ 	}
+ 
+-	_cupsRWUnlock(&(client->printer->rwlock));
+ 
+ 	respond_ipp(client, IPP_STATUS_OK, NULL);
+         break;
+   }
++  _cupsRWUnlock(&(client->printer->rwlock));
+ }
+ 
+ 
+@@ -3266,8 +3513,18 @@
+       }
+       else
+       {
+-	job->state     = IPP_JSTATE_CANCELED;
+-	job->completed = time(NULL);
++	if (!clear_checkpoint(client->printer))
++          {
++            respond_ipp(client, IPP_STATUS_ERROR_INTERNAL, "Unable to clear active-job checkpoint.");
++            _cupsRWUnlock(&(client->printer->rwlock));
++            return;
++          }
++          job->state     = IPP_JSTATE_CANCELED;
++          job->completed = time(NULL);
++          if (job->filename && !KeepFiles) unlink(job->filename);
++          client->printer->active_job = NULL;
++          client->printer->state = IPP_PSTATE_IDLE;
++          client->printer->state_reasons &= (ippeve_preason_t)~IPPEVE_PREASON_OTHER;
+       }
+     }
+   }
+@@ -3387,7 +3644,9 @@
+   cupsArrayAdd(ra, "job-state-reasons");
+   cupsArrayAdd(ra, "job-uri");
+ 
++  _cupsRWLockWrite(&(client->printer->rwlock));
+   copy_job_attributes(client, job, ra);
++  _cupsRWUnlock(&(client->printer->rwlock));
+   cupsArrayDelete(ra);
+ }
+ 
+@@ -3413,7 +3672,9 @@
+   respond_ipp(client, IPP_STATUS_OK, NULL);
+ 
+   ra = ippCreateRequestedArray(client->request);
++  _cupsRWLockWrite(&(client->printer->rwlock));
+   copy_job_attributes(client, job, ra);
++  _cupsRWUnlock(&(client->printer->rwlock));
+   cupsArrayDelete(ra);
+ }
+ 
+@@ -3564,7 +3825,7 @@
+ 
+   respond_ipp(client, IPP_STATUS_OK, NULL);
+ 
+-  _cupsRWLockRead(&(client->printer->rwlock));
++  _cupsRWLockWrite(&(client->printer->rwlock));
+ 
+   for (count = 0, job = (ippeve_job_t *)cupsArrayFirst(client->printer->jobs);
+        (limit <= 0 || count < limit) && job;
+@@ -3618,8 +3879,13 @@
+ 
+   _cupsRWLockRead(&(printer->rwlock));
+ 
+-  copy_attributes(client->response, printer->attrs, ra, IPP_TAG_ZERO,
+-		  IPP_TAG_CUPS_CONST);
++  if (!copy_attributes(client->response, printer->attrs, ra, IPP_TAG_ZERO))
++  {
++    _cupsRWUnlock(&(printer->rwlock));
++    cupsArrayDelete(ra);
++    respond_ipp(client, IPP_STATUS_ERROR_INTERNAL, "Unable to copy printer attributes.");
++    return;
++  }
+ 
+   if (!ra || cupsArrayFind(ra, "printer-config-change-date-time"))
+     ippAddDate(client->response, IPP_TAG_PRINTER, "printer-config-change-date-time", ippTimeToDate(printer->config_time));
+@@ -3667,7 +3933,7 @@
+   {
+     static const char * const messages[] = { "Idle.", "Printing.", "Stopped." };
+ 
+-    ippAddString(client->response, IPP_TAG_PRINTER, IPP_CONST_TAG(IPP_TAG_TEXT), "printer-state-message", NULL, messages[printer->state - IPP_PSTATE_IDLE]);
++    ippAddString(client->response, IPP_TAG_PRINTER, IPP_TAG_TEXT, "printer-state-message", NULL, printer->state == IPP_PSTATE_STOPPED && printer->active_job && printer->active_job->message ? printer->active_job->message : messages[printer->state - IPP_PSTATE_IDLE]);
+   }
+ 
+   if (!ra || cupsArrayFind(ra, "printer-state-reasons"))
+@@ -3956,7 +4222,12 @@
+ 
+   _cupsRWLockWrite(&(client->printer->rwlock));
+ 
+-  copy_attributes(job->attrs, client->request, NULL, IPP_TAG_JOB, 0);
++  if (!copy_attributes(job->attrs, client->request, NULL, IPP_TAG_JOB))
++  {
++    _cupsRWUnlock(&(client->printer->rwlock));
++    respond_ipp(client, IPP_STATUS_ERROR_INTERNAL, "Unable to copy job attributes.");
++    return;
++  }
+ 
+   if ((attr = ippFindAttribute(job->attrs, "document-format-detected", IPP_TAG_MIMETYPE)) != NULL)
+     job->format = ippGetString(attr, 0, NULL);
+@@ -4043,7 +4314,12 @@
+ 
+   _cupsRWLockWrite(&(client->printer->rwlock));
+ 
+-  copy_attributes(job->attrs, client->request, NULL, IPP_TAG_JOB, 0);
++  if (!copy_attributes(job->attrs, client->request, NULL, IPP_TAG_JOB))
++  {
++    _cupsRWUnlock(&(client->printer->rwlock));
++    respond_ipp(client, IPP_STATUS_ERROR_INTERNAL, "Unable to copy job attributes.");
++    return;
++  }
+ 
+   if ((attr = ippFindAttribute(job->attrs, "document-format-detected", IPP_TAG_MIMETYPE)) != NULL)
+     job->format = ippGetString(attr, 0, NULL);
+@@ -6631,9 +6907,31 @@
+ static void *				/* O - Thread exit status */
+ process_job(ippeve_job_t *job)		/* I - Job */
+ {
++  int failed = 0;
++
++  _cupsRWLockWrite(&(job->printer->rwlock));
++  if (job->printer->active_job != job || job->state >= IPP_JSTATE_CANCELED)
++  {
++    _cupsRWUnlock(&(job->printer->rwlock));
++    return (NULL);
++  }
++  if (job->cancel)
++  {
++    _cupsRWUnlock(&(job->printer->rwlock));
++    goto error;
++  }
++  job->processing = time(NULL);
++  if (!checkpoint_job(job))
++  {
++    job->message = strdup("Unable to persist active job; print command was not started.");
++    stop_job(job);
++    _cupsRWUnlock(&(job->printer->rwlock));
++    return (NULL);
++  }
+   job->state          = IPP_JSTATE_PROCESSING;
+   job->printer->state = IPP_PSTATE_PROCESSING;
+   job->processing     = time(NULL);
++  _cupsRWUnlock(&(job->printer->rwlock));
+ 
+   while (job->printer->state_reasons & IPPEVE_PREASON_MEDIA_EMPTY)
+   {
+@@ -6691,7 +6989,12 @@
+     if (myenvc > (int)(sizeof(myenvp) / sizeof(myenvp[0]) - 32))
+     {
+       fprintf(stderr, "[Job %d] Too many environment variables to process job.\n", job->id);
+-      job->state = IPP_JSTATE_ABORTED;
++      _cupsRWLockWrite(&(job->printer->rwlock));
++      free(job->message);
++      job->message = strdup("Too many environment variables to process job.");
++      _cupsRWUnlock(&(job->printer->rwlock));
++      failed = 1;
++      while (myenvc > 0) free(myenvp[--myenvc]);
+       goto error;
+     }
+ 
+@@ -6789,7 +7092,12 @@
+     if (attr)
+     {
+       fprintf(stderr, "[Job %d] Too many environment variables to process job.\n", job->id);
+-      job->state = IPP_JSTATE_ABORTED;
++      _cupsRWLockWrite(&(job->printer->rwlock));
++      free(job->message);
++      job->message = strdup("Too many environment variables to process job.");
++      _cupsRWUnlock(&(job->printer->rwlock));
++      failed = 1;
++      while (myenvc > 0) free(myenvp[--myenvc]);
+       goto error;
+     }
+ 
+@@ -6884,7 +7192,14 @@
+     if (pipe(mypipe))
+     {
+       fprintf(stderr, "[Job %d] Unable to create pipe for stderr: %s\n", job->id, strerror(errno));
+-      mypipe[0] = mypipe[1] = -1;
++      close(mystdout);
++      while (myenvc > 0) free(myenvp[--myenvc]);
++      _cupsRWLockWrite(&(job->printer->rwlock));
++      free(job->message);
++      job->message = strdup("Unable to create command stderr pipe.");
++      _cupsRWUnlock(&(job->printer->rwlock));
++      failed = 1;
++      goto error;
+     }
+ 
+     if ((pid = fork()) == 0)
+@@ -6989,8 +7304,12 @@
+ 	      */
+ 
+               level         = 0;
++              _cupsRWLockWrite(&(job->printer->rwlock));
++              free(job->message);
+               job->message  = strdup(line + 6);
++              checkpoint_job(job);
+               job->msglevel = 0;
++              _cupsRWUnlock(&(job->printer->rwlock));
+ 	    }
+ 	    else if (!strncmp(line, "INFO:", 5))
+ 	    {
+@@ -7001,8 +7320,11 @@
+               level = 1;
+               if (job->msglevel)
+               {
++                _cupsRWLockWrite(&(job->printer->rwlock));
++                free(job->message);
+                 job->message  = strdup(line + 5);
+                 job->msglevel = 1;
++                _cupsRWUnlock(&(job->printer->rwlock));
+ 	      }
+ 	    }
+ 	    else if (!strncmp(line, "STATE:", 6))
+@@ -7023,7 +7345,28 @@
+ 	    endptr -= bytes;
+ 	    *endptr = '\0';
+ 	  }
++	  if (endptr == line + sizeof(line) - 1)
++          {
++            if (!strncmp(line, "ERROR:", 6))
++            {
++              _cupsRWLockWrite(&(job->printer->rwlock));
++              free(job->message);
++              job->message = strdup(line + 6);
++              checkpoint_job(job);
++              _cupsRWUnlock(&(job->printer->rwlock));
++            }
++            endptr = line;
++          }
+ 	}
++        if (endptr > line && !strncmp(line, "ERROR:", 6))
++        {
++          *endptr = '\0';
++          _cupsRWLockWrite(&(job->printer->rwlock));
++          free(job->message);
++          job->message = strdup(line + 6);
++          checkpoint_job(job);
++          _cupsRWUnlock(&(job->printer->rwlock));
++        }
+ 
+ 	close(mypipe[0]);
+       }
+@@ -7050,7 +7393,14 @@
+       else
+ 	fprintf(stderr, "[Job %d] Command \"%s\" terminated with signal %d.\n", job->id, job->printer->command, WTERMSIG(status));
+ #endif /* !_WIN32 */
+-      job->state = IPP_JSTATE_ABORTED;
++      _cupsRWLockWrite(&(job->printer->rwlock));
++      if (!job->message)
++      {
++        snprintf(val, sizeof(val), "Print command failed (status %d); explicit cancellation is required.", status);
++        job->message = strdup(val);
++      }
++      _cupsRWUnlock(&(job->printer->rwlock));
++      failed = 1;
+     }
+     else
+       fprintf(stderr, "[Job %d] Command \"%s\" completed successfully.\n", job->id, job->printer->command);
+@@ -7072,16 +7422,34 @@
+     sleep((unsigned)(5 + (CUPS_RAND() % 11)));
+   }
+ 
++  error:
++
++  _cupsRWLockWrite(&(job->printer->rwlock));
++  if (job->printer->active_job != job)
++  {
++    _cupsRWUnlock(&(job->printer->rwlock));
++    return (NULL);
++  }
+   if (job->cancel)
+     job->state = IPP_JSTATE_CANCELED;
++  else if (failed)
++    stop_job(job);
+   else if (job->state == IPP_JSTATE_PROCESSING)
+     job->state = IPP_JSTATE_COMPLETED;
+ 
+-  error:
++  if (job->state == IPP_JSTATE_STOPPED || !clear_checkpoint(job->printer))
++  {
++    stop_job(job);
++    if (!checkpoint_job(job))
++      fprintf(stderr, "[Job %d] Unable to update stopped-job checkpoint.\n", job->id);
++    _cupsRWUnlock(&(job->printer->rwlock));
++    return (NULL);
++  }
+ 
+   job->completed           = time(NULL);
+   job->printer->state      = IPP_PSTATE_IDLE;
+   job->printer->active_job = NULL;
++  _cupsRWUnlock(&(job->printer->rwlock));
+ 
+   return (NULL);
+ }
