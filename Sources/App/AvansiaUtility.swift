@@ -226,6 +226,9 @@ struct PrinterSettingsView: View {
                     Button("Read Settings") { Task { await model.refreshSettings() } }.disabled(!model.canReadDetails)
                 }
                 if model.settingsNeedRefresh { Text("Read settings before applying a change. After an uncertain result, refresh before trying again.").foregroundStyle(.secondary) }
+                if model.settings != nil && !model.settingsMatchCurrentDevice {
+                    Text("These settings belong to another or unidentified printer. Read settings again before making changes.").foregroundStyle(.orange)
+                }
                 if let settings = model.settings {
                     ForEach(Array(Set(settings.settings.map(\.group))).sorted(), id: \.self) { group in
                         GroupBox(AppStrings.text(group)) {
@@ -259,9 +262,9 @@ struct SettingRow: View {
                 if let choices = setting.choices, !choices.isEmpty {
                     Picker(setting.displayLabel, selection: $proposed) {
                         ForEach(choices) { choice in Text(AppStrings.text(choice.label)).tag(String(choice.value)) }
-                    }.labelsHidden().frame(maxWidth: 190)
+                    }.labelsHidden().frame(maxWidth: 190).disabled(!model.canChangeSettings)
                 } else {
-                    TextField("Value", text: $proposed).frame(width: 65).textFieldStyle(.roundedBorder)
+                    TextField("Value", text: $proposed).frame(width: 65).textFieldStyle(.roundedBorder).disabled(!model.canChangeSettings)
                     Text("\(setting.minimum ?? 0)…\(setting.maximum ?? 0)").font(.caption).foregroundStyle(.secondary)
                 }
                 Button("Apply") { if let value = Int(proposed) { Task { await model.apply(setting, value: value) } } }

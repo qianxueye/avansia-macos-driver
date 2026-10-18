@@ -11,6 +11,8 @@ let physicalScale = 600.0 / 72.0
 let cardWidth = 85.6 / 25.4 * 600
 let cardHeight = 53.98 / 25.4 * 600
 let space = CGColorSpace(name: CGColorSpace.sRGB)!
+let localScheduler = "/private/var/run/cupsd"
+let localCUPSCommands: Set<String> = ["/usr/bin/lpstat", "/usr/sbin/lpadmin", "/usr/bin/lp", "/usr/bin/cancel"]
 func require(_ condition: @autoclosure () -> Bool, _ message: String) {
     guard condition() else { fatalError(message) }
 }
@@ -20,7 +22,10 @@ func close(_ a: Double, _ b: Double, _ message: String, tolerance: Double = 0.00
 func run(_ executable: String, _ arguments: [String]) throws -> (Int32, Data, String) {
     let process = Process(), output = Pipe(), errors = Pipe()
     process.executableURL = URL(fileURLWithPath: executable)
-    process.arguments = arguments
+    process.arguments = localCUPSCommands.contains(executable) ? ["-h", localScheduler] + arguments : arguments
+    var environment = ProcessInfo.processInfo.environment
+    environment["CUPS_SERVER"] = localScheduler
+    process.environment = environment
     process.standardOutput = output; process.standardError = errors
     try process.run()
     let data = output.fileHandleForReading.readDataToEndOfFile()
@@ -361,7 +366,7 @@ func queueGate() throws -> [[String: Any]] {
 }
 let scheduler = try queueGate()
 
-let report: [String: Any] = ["direct_pdf_ppd_directive":directDirective,"forwarding_strategy":"CUPS 2.4.14 software RIP metadata; no mandatory optional-job fields","direct_route":routes,"native_scheduler_capture":scheduler,
+let report: [String: Any] = ["local_scheduler":localScheduler,"direct_pdf_ppd_directive":directDirective,"forwarding_strategy":"CUPS 2.4.14 software RIP metadata; no mandatory optional-job fields","direct_route":routes,"native_scheduler_capture":scheduler,
                             "negative_control_filter":String(decoding:oldRoute.1,as:UTF8.self).trimmingCharacters(in:.whitespacesAndNewlines),
                             "geometry":geometry,"geometry_cases":geometry.count,"geometry_checks_reused_from_prior_checkpoint":queueOnly,
                             "limits":"Native software scheduler and raster checks only; no physical transport or card acceptance.",

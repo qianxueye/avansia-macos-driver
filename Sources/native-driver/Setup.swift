@@ -24,13 +24,16 @@ let service = domain + "/local.avansia.ipp"
 
 @discardableResult
 func run(_ executable: String, _ arguments: [String], checked: Bool = true) throws -> (Int32, String) {
+    let localCommands = ["/usr/bin/lpstat", "/usr/bin/lpoptions", "/usr/sbin/lpadmin", "/usr/sbin/cupsaccept",
+                         "/usr/sbin/cupsreject", "/usr/sbin/cupsenable", "/usr/sbin/cupsdisable"]
+    let commandArguments = localCommands.contains(executable) ? ["-h", "/private/var/run/cupsd"] + arguments : arguments
 #if SETUP_TESTS
-    return try setupTestRun(executable, arguments, checked)
+    return try setupTestRun(executable, commandArguments, checked)
 #else
     let process = Process()
     let output = Pipe()
     process.executableURL = URL(fileURLWithPath: executable)
-    process.arguments = arguments
+    process.arguments = commandArguments
     var environment = ProcessInfo.processInfo.environment
     environment["LC_ALL"] = "C"
     environment["LANG"] = "C"
@@ -79,6 +82,25 @@ func queueDeviceURI() throws -> String? {
 }
 
 func ownedQueue(_ deviceURI: String?) -> Bool { deviceURI == uri }
+
+func serverDefaultQueue() throws -> String? {
+#if SETUP_TESTS
+    return try setupTestDefaultQueue()
+#else
+    var name = [CChar](repeating: 0, count: 1024)
+    var error = [CChar](repeating: 0, count: 1024)
+    let result = avansia_default_queue(&name, name.count, &error, error.count)
+    guard result >= 0 else { throw SetupError("Cannot query the CUPS server default: " + String(cString: error)) }
+    return result == 0 ? nil : String(cString: name)
+#endif
+}
+
+func restoreServerDefault() throws {
+    guard ownedQueue(try queueDeviceURI()) else { throw SetupError("The queue changed before restoring the server default") }
+    if try serverDefaultQueue() == queue { return }
+    try run("/usr/sbin/lpadmin", ["-d", queue])
+    guard try serverDefaultQueue() == queue else { throw SetupError("The previous server default printer was not restored") }
+}
 
 func setupLock() throws -> Int32 {
 #if SETUP_TESTS
@@ -335,6 +357,7 @@ func upgrade(_ source: URL) throws {
     guard ownedQueue(existing) else { throw SetupError("Refusing to update another printer") }
     try requireNoCard()
     guard try pendingJobs().isEmpty else { throw SetupError("Finish or cancel Avansia jobs before updating") }
+    let wasDefault = try serverDefaultQueue() == queue
     let staging = try stageRuntime(source)
     defer { try? files.removeItem(at: staging) }
     let oldRuntimeIdentity = try files.attributesOfItem(atPath: runtime.path)
@@ -391,10 +414,15 @@ func upgrade(_ source: URL) throws {
                                              "-o", "printer-is-shared=false", "-o", "printer-error-policy=abort-job"])
             }
             try restoreQueueState(accepting: accepted, paused: paused)
+            if wasDefault { try restoreServerDefault() }
         } catch {
             throw SetupError("Update failed: \(originalError). Recovery requires attention: \(error). Prior runtime archives remain at \(base.path)", recoveryIncomplete: true)
         }
         throw SetupError("Update failed; the prior installation was restored. \(originalError)")
+    }
+    if wasDefault {
+        do { try restoreServerDefault() }
+        catch { throw SetupError("Update installed the new driver, but server default recovery requires attention: \(error)", recoveryIncomplete: true) }
     }
 }
 

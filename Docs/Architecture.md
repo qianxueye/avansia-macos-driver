@@ -63,9 +63,10 @@ and `writable`) and `information` (label/value observations). Discover selectors
 from the connected device. Unknown/action descriptors are read-only. The UI
 never supplies raw selector or payload bytes.
 
-`AvansiaCore set-setting ID EXPECTED VALUE` changes one allowlisted USER scalar
+`AvansiaCore set-setting ID EXPECTED VALUE --device-serial SERIAL` changes one allowlisted USER scalar
 or choice setting. Require idle queue and printer, shared mutex, matching fresh
-identity/type/range and expected current value; write once and require exact
+printer serial, descriptor identity/type/range and expected current value;
+write once and require exact
 fresh readback. An uncertain result requires explicit refresh before another
 attempt. Service actions, firmware, movement and unknown fields are not generic
 write targets. A verified black-quality descriptor may be added as one explicit
@@ -82,6 +83,10 @@ authorization and malformed-response failures remain errors. Human-readable
 CUPS output is not an identity interface, and command locale settings do not
 guarantee the language selected by macOS CUPS. Retained runtime files are
 separate from verified queue/service installation state.
+
+All CUPS queue commands and PDF submissions explicitly select the same local
+Unix socket. A configured remote scheduler cannot redirect an operation after
+local queue ownership has been verified.
 
 The public repository contains owned native sources, synthetic tests, build
 scripts, reviewed CUPS patches and required open-source notices. The source is

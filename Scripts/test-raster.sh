@@ -1,12 +1,13 @@
 #!/bin/sh
 set -eu
+export CUPS_SERVER=/private/var/run/cupsd
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)
 RUN=$(mktemp -d "${TMPDIR:-/private/tmp/}avansia-raster-tests.XXXXXX")
 RUN=$(CDPATH= cd -- "$RUN" && pwd -P)
 cleanup() {
     if [ -f "$RUN/test-queue-name" ]; then
         queue=$(cat "$RUN/test-queue-name")
-        case "$queue" in Avansia_Raster_Test_[0-9]*) /usr/sbin/lpadmin -x "$queue" >/dev/null 2>&1 || : ;; esac
+        case "$queue" in Avansia_Raster_Test_[0-9]*) /usr/sbin/lpadmin -h /private/var/run/cupsd -x "$queue" >/dev/null 2>&1 || : ;; esac
     fi
     if [ -f "$RUN/test-server-pid" ]; then
         server_pid=$(cat "$RUN/test-server-pid")

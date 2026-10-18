@@ -225,3 +225,5 @@
 "Runtime files" = "运行时文件";
 "Unavailable" = "不可用";
 "Printing requires a verified installation with no recovery pending." = "打印前必须核实驱动安装完整，并处理尚未完成的恢复事项。";
+"The printer could not refresh its settings. Cached values remain read-only; read the details before trying again." = "未能刷新打印机设置。缓存值保持只读；请查看技术详情后再重新读取。";
+"These settings belong to another or unidentified printer. Read settings again before making changes." = "这些设置属于另一台打印机，或当前设备身份尚未确认。请重新读取设置后再修改。";

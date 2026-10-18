@@ -104,9 +104,9 @@ final class DeviceMenu {
         func request(_ opcode:UInt8,_ length:Int,_ count:Int) throws -> [UInt8] {
             try transport.write([28,opcode,0,0,0,10]+selector+[UInt8(length>>8),UInt8(length&255)],timeout:5000)
             let header=try transport.read(6,timeout:5000)
-            try require(header==[28,opcode]+be32(count),"Invalid menu response header")
+            guard header==[28,opcode]+be32(count) else { throw DeviceAccessFailure(connection:"error",description:"Invalid menu response header") }
             let payload=try transport.read(count,timeout:5000)
-            try require(payload.count==count,"Truncated menu response")
+            guard payload.count==count else { throw DeviceAccessFailure(connection:"error",description:"Truncated menu response") }
             return payload
         }
         let size=try request(0x4d,2,2), count=Int(size[0])<<8|Int(size[1])

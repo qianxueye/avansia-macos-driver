@@ -7,7 +7,7 @@
     "observed_at": "2026-01-01T12:00:00Z",
     "connection": "ready",
     "stale": true,
-    "device": {"model": "Synthetic Avansia", "firmware": "Fixture"},
+    "device": {"model": "Synthetic Avansia", "firmware": "Fixture", "serial": "SYNTHETIC-PREVIEW"},
     "ribbon": {"remaining_percent": 72, "reference": "SYNTHETIC", "label": "Example YMCK ribbon", "region": "Example", "identity_observed_at": "2026-01-01T12:00:00Z"},
     "film": {"remaining_percent": null, "type": "Unknown"},
     "accessories": [
@@ -20,6 +20,7 @@
   "settings": {
     "schema_version": 1,
     "stale": true,
+    "device_serial": "SYNTHETIC-PREVIEW",
     "settings": [
       {"id": "image.sharpness", "label": "Sharpness", "group": "Image Setup", "type": "scalar", "current": 0, "minimum": -2, "maximum": 2, "choices": [], "writable": true},
       {"id": "example.choice", "label": "Choice fixture", "group": "Example", "type": "choice", "current": 0, "minimum": 0, "maximum": 1, "choices": [{"value": 0, "label": "First option"}, {"value": 1, "label": "Second option"}], "writable": true},

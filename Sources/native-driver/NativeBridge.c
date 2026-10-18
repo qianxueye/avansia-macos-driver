@@ -69,6 +69,37 @@ int avansia_queue_uri(const char *name, char *uri, size_t uri_capacity, char *er
     httpClose(http);
     return result;
 }
+int avansia_default_queue(char *name, size_t name_capacity, char *error, size_t error_capacity) {
+    if (!name || !name_capacity) return failure(error, error_capacity, "Invalid default queue query");
+    name[0] = '\0';
+    http_t *http = httpConnect2("/private/var/run/cupsd", 631, NULL, AF_UNSPEC, HTTP_ENCRYPTION_IF_REQUESTED, 1, 2000, NULL);
+    if (!http) return failure(error, error_capacity, "Cannot connect to local CUPS to query the server default");
+    httpSetTimeout(http, 2.0, NULL, NULL);
+    ipp_t *request = ippNewRequest(IPP_OP_CUPS_GET_DEFAULT);
+    ippAddString(request, IPP_TAG_OPERATION, IPP_TAG_KEYWORD, "requested-attributes", NULL, "printer-name");
+    ipp_t *response = cupsDoRequest(http, request, "/");
+    int result = -1;
+    if (!response) failure(error, error_capacity, "Local CUPS did not return a server default response");
+    else if (ippGetStatusCode(response) == IPP_STATUS_ERROR_NOT_FOUND) result = 0;
+    else if (ippGetStatusCode(response) >= IPP_STATUS_ERROR_BAD_REQUEST)
+        failure(error, error_capacity, "Local CUPS rejected the server default query");
+    else {
+        ipp_attribute_t *identity = NULL;
+        int identities = 0;
+        for (ipp_attribute_t *attribute = ippFirstAttribute(response); attribute; attribute = ippNextAttribute(response)) {
+            const char *attribute_name = ippGetName(attribute);
+            if (attribute_name && !strcmp(attribute_name, "printer-name")) { identity = attribute; ++identities; }
+        }
+        const char *value = identities == 1 && ippGetGroupTag(identity) == IPP_TAG_PRINTER &&
+            ippGetValueTag(identity) == IPP_TAG_NAME && ippGetCount(identity) == 1 ? ippGetString(identity, 0, NULL) : NULL;
+        if (!value || !value[0]) failure(error, error_capacity, "Local CUPS returned an incomplete default printer-name");
+        else if (strlen(value) >= name_capacity) failure(error, error_capacity, "The default printer-name exceeds its buffer");
+        else { memcpy(name, value, strlen(value) + 1); result = 1; }
+    }
+    if (response) ippDelete(response);
+    httpClose(http);
+    return result;
+}
 int avansia_job_cancelled(const char *uri, char *error, size_t capacity) {
     char scheme[32], user[256], host[256], resource[1024];
     int port = 0;

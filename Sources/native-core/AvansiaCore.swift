@@ -156,26 +156,26 @@ final class USB {
     }
     deinit { if handle != nil { close(handle) }; if context != nil { exitUSB(context) }; if lock >= 0 { Darwin.close(lock) }; dlclose(libraryHandle) }
     func write(_ data: [UInt8], timeout: UInt32 = 5000) throws {
-        let rc = claim(handle, 0); try require(rc == 0, "Avansia USB interface is unavailable: \(rc)")
+        let rc = claim(handle, 0); if rc != 0 { throw DeviceAccessFailure(connection:rc == -4 ? "disconnected" : "error",description:"Avansia USB interface is unavailable: \(rc)") }
         defer { _ = release(handle, 0) }
         var offset = 0
         while offset < data.count {
             var chunk = Array(data[offset..<min(data.count, offset + 65536)]), sent: Int32 = 0
             let count = chunk.count
             let rc = chunk.withUnsafeMutableBytes { bulk(handle, 1, $0.baseAddress, Int32(count), &sent, timeout) }
-            try require(rc == 0 && sent == count, "USB write failed: \(rc); accepted \(sent)/\(count) bytes; do not retry a print automatically")
+            if rc != 0 || sent != count { throw DeviceAccessFailure(connection:rc == -4 ? "disconnected" : "error",description:"USB write failed: \(rc); accepted \(sent)/\(count) bytes; do not retry a print automatically") }
             offset += Int(sent)
         }
     }
     func read(_ size: Int, timeout: UInt32 = 5000) throws -> [UInt8] {
         while buffer.count < size {
-            let rc = claim(handle, 0); try require(rc == 0, "Avansia USB interface is unavailable: \(rc)")
+            let rc = claim(handle, 0); if rc != 0 { throw DeviceAccessFailure(connection:rc == -4 ? "disconnected" : "error",description:"Avansia USB interface is unavailable: \(rc)") }
             do {
                 defer { _ = release(handle, 0) }
                 _ = control(handle, 0x21, 1, 0, 0, nil, 0, timeout)
                 var raw = [UInt8](repeating: 0, count: 65536), received: Int32 = 0
                 let rc = raw.withUnsafeMutableBytes { bulk(handle, 0x81, $0.baseAddress, 65536, &received, timeout) }
-                try require((rc == 0 || rc == -7) && received > 0, "USB read failed: \(rc); received \(received) bytes")
+                if !((rc == 0 || rc == -7) && received > 0) { throw DeviceAccessFailure(connection:rc == -4 ? "disconnected" : "error",description:"USB read failed: \(rc); received \(received) bytes") }
                 buffer += raw.prefix(Int(received))
             }
         }
@@ -185,7 +185,7 @@ final class USB {
         try require(command == 89 || command == 84, "Unsupported printer query")
         try write([28,command] + be32(expected))
         let header = try read(6), size = integer(header[2..<6])
-        try require(header[0...1] == [28, command] && size <= 4096, "Unexpected printer response: \(hex(header))")
+        guard header[0...1] == [28, command] && size <= 4096 else { throw DeviceAccessFailure(connection:"error",description:"Unexpected printer response: \(hex(header))") }
         return try read(size)
     }
     func status() throws -> [String: Any] {
@@ -195,7 +195,7 @@ final class USB {
     func send(_ command: UInt8, _ payload: [UInt8]) throws {
         try write([28,command] + be32(payload.count) + payload)
         let ack = try read(6)
-        try require(ack[0...1] == [28,command], "Unexpected RFID transport acknowledgement: \(hex(ack))")
+        guard ack[0...1] == [28,command] else { throw DeviceAccessFailure(connection:"error",description:"Unexpected RFID transport acknowledgement: \(hex(ack))") }
     }
     func exchange(_ opcode: UInt8, _ payload: [UInt8], timeout: Double = 2) throws -> [UInt8] {
         let size = payload.count + 3
@@ -204,14 +204,14 @@ final class USB {
         while ProcessInfo.processInfo.systemUptime < deadline {
             try write([28,68] + be32(1024))
             let header = try read(6, timeout: 250), count = integer(header[2..<6])
-            try require(header[0...1] == [28,68] && count <= 1024, "Unexpected RFID transport response")
+            guard header[0...1] == [28,68] && count <= 1024 else { throw DeviceAccessFailure(connection:"error",description:"Unexpected RFID transport response") }
             let data = try read(count, timeout: 250)
             if data.count >= 2 {
                 let available = Int(Int16(bitPattern: UInt16(data[0]) << 8 | UInt16(data[1])))
                 try require(available >= 0, "RFID interface reported an error: \(available)")
                 if available > 2 && data.count >= 5 {
                     let length = Int(data[3]) | Int(data[4]) << 8
-                    try require(length >= 3 && length <= 1022, "Invalid RFID response length")
+                    guard length >= 3 && length <= 1022 else { throw DeviceAccessFailure(connection:"error",description:"Invalid RFID response length") }
                     if available >= length && data.count >= length + 2 {
                         try require(data[2] == opcode, "RFID details query failed with response code \(data[2])")
                         return Array(data[5..<length + 2])
@@ -220,7 +220,7 @@ final class USB {
             }
             usleep(10000)
         }
-        throw Failure("RFID details read timed out")
+        throw DeviceAccessFailure(connection:"error",description:"RFID details read timed out")
     }
     func ribbonStatus() throws -> [String: Any] {
         let state = try status(), flags = Int(state["flags"] as! String, radix: 16)!
@@ -241,7 +241,17 @@ final class USB {
                 details[field] = plaintext.map { $0 < 128 ? String(UnicodeScalar($0)) : String(format: "\\x%02x", $0) }.joined()
             }
         } catch { activeError = error }
-        do { try send(80, Array("\u{1b}E7,4.".utf8)) } catch { if let activeError { throw Failure("\(activeError); RFID session cleanup also failed: \(error)") }; throw error }
+        if let failure=activeError as? DeviceAccessFailure { throw failure }
+        do { try send(80, Array("\u{1b}E7,4.".utf8)) } catch {
+            if let activeError {
+                let message="\(activeError); RFID session cleanup also failed: \(error)"
+                if let failure=(error as? DeviceAccessFailure) ?? (activeError as? DeviceAccessFailure) {
+                    throw DeviceAccessFailure(connection:failure.connection,description:message)
+                }
+                throw Failure(message)
+            }
+            throw error
+        }
         if let activeError { throw activeError }
         var result = try status(); result["ribbon"] = details
         result["detected_ribbon"] = details["label"] == "Color YMCK RT" ? "YMCK" : details["label"] == "Color YMCKK RT" ? "YMCKK" as Any : NSNull()
@@ -534,9 +544,9 @@ func coreMain() throws -> [String: Any] {
         return try DeviceManager().settings()
     }
     if command == "set-setting" {
-        try require(args.count==3,"Usage: set-setting ID EXPECTED VALUE")
+        try require(args.count==5 && args[3]=="--device-serial","Usage: set-setting ID EXPECTED VALUE --device-serial SERIAL")
         guard let expected=Int(args[1]),let value=Int(args[2]) else { throw Failure("Setting values must be integers") }
-        return try DeviceManager().setSetting(args[0],expected:expected,value:value)
+        return try DeviceManager().setSetting(args[0],expected:expected,value:value,expectedSerial:args[4])
     }
     if command == "validate" {
         try require(args.count == 1,"Usage: validate PRN")

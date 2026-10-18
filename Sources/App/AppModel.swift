@@ -74,6 +74,10 @@ struct PrinterSnapshot: Decodable {
     var recoveryRequired: Bool { connection == "recovery" || queue?.recovery_required == true }
     var busy: Bool { connection == "busy" || queue?.active == true }
     var connectionText: String { AppStrings.connection(connection) }
+    var deviceSerial: String? {
+        guard case .string(let value)? = device?["serial"], !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+        return value
+    }
     func isStale(at now: Date = Date()) -> Bool {
         guard !stale, let text = observed_at, let observed = Self.date(text) else { return true }
         let age = now.timeIntervalSince(observed)
@@ -119,6 +123,9 @@ struct SettingsSnapshot: Decodable {
     let stale: Bool
     let settings: [PrinterSetting]
     let information: [PrinterInformation]?
+    let device_serial: String?
+    let error: String?
+    let settings_refresh_required: Bool?
 }
 struct CommandResult: Sendable {
     let status: Int32
@@ -217,14 +224,19 @@ struct NativeCommandRunner: AppCommandRunning {
     var canPrint: Bool { commandsAllowed && runtimeAvailable && installationState == .installed && snapshot?.recoveryRequired != true }
     var stale: Bool { cacheError != nil || snapshot?.isStale() != false }
     var canReadDetails: Bool { commandsAllowed && runtimeAvailable && snapshot?.busy != true && snapshot?.recoveryRequired != true }
-    var canChangeSettings: Bool { canReadDetails && snapshot?.connection == "ready" && !stale && !settingsNeedRefresh }
+    var settingsMatchCurrentDevice: Bool {
+        guard let serial = settings?.device_serial, !serial.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return false }
+        return snapshot?.deviceSerial == serial
+    }
+    var canChangeSettings: Bool { canReadDetails && snapshot?.connection == "ready" && !stale && !settingsNeedRefresh && settingsMatchCurrentDevice && settings?.stale == false && settings?.error == nil }
     var canAcknowledge: Bool { commandsAllowed && runtimeAvailable && inspected && snapshot?.recoveryRequired == true && snapshot?.queue?.active_job == .bool(false) }
     init(base: URL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/AvansiaDriver"),
          package: URL = (Bundle.main.resourceURL ?? Bundle.main.bundleURL).appendingPathComponent("Driver"),
+         agentFile: URL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/LaunchAgents/local.avansia.ipp.plist"),
          fixture: URL? = ProcessInfo.processInfo.environment["AVANSIA_UI_FIXTURE"].map { URL(fileURLWithPath: $0) },
          runner: any AppCommandRunning = NativeCommandRunner(), installationProbe: AppInstallationProbe? = nil) {
         self.base = base; self.package = package; self.fixture = fixture; self.runner = runner
-        self.installationProbe = installationProbe ?? AppInstallationProbe(setup: package.appendingPathComponent("AvansiaSetup"), runner: runner)
+        self.installationProbe = installationProbe ?? AppInstallationProbe(setup: package.appendingPathComponent("AvansiaSetup"), agentFile: agentFile, runner: runner)
     }
     func reloadCache() {
         runtimeAvailable = FileManager.default.isExecutableFile(atPath: core.path)
@@ -242,8 +254,9 @@ struct NativeCommandRunner: AppCommandRunning {
             snapshot = decoded
             if fixture != nil, let fixtureSettings = object?["settings"] {
                 settings = try JSONDecoder().decode(SettingsSnapshot.self, from: JSONSerialization.data(withJSONObject: fixtureSettings))
-                settingsNeedRefresh = settings?.stale != false
+                settingsNeedRefresh = settings?.stale != false || settings?.error != nil || settings?.settings_refresh_required == true
             }
+            if settings != nil && !settingsMatchCurrentDevice { settingsNeedRefresh = true }
             cacheError = nil; cacheDetails = nil
         } catch {
             cacheError = AppStrings.text(runtimeAvailable ? "Status is unavailable. Use Refresh to request a new observation." : "The driver is not installed. Install it to start monitoring.")
@@ -311,16 +324,22 @@ struct NativeCommandRunner: AppCommandRunning {
         do {
             let result = try JSONDecoder().decode(SettingsSnapshot.self, from: Data(text.utf8))
             guard result.schema_version == 1 else { throw AppFailure.message("Unsupported settings format") }
-            settings = result; settingsNeedRefresh = result.stale
+            settings = result
+            settingsNeedRefresh = result.stale || result.error != nil || result.settings_refresh_required == true || !settingsMatchCurrentDevice
+            if let error = result.error {
+                actionError = AppStrings.text("The printer could not refresh its settings. Cached values remain read-only; read the details before trying again.")
+                actionDetails = error
+            }
         } catch {
             actionError = AppStrings.text("The settings response could not be read. Refresh settings before making changes.")
             actionDetails = error.localizedDescription
         }
     }
     func apply(_ setting: PrinterSetting, value: Int) async {
-        guard canChangeSettings, setting.acceptsInput, setting.accepts(value), let expected = setting.current, value != expected else { return }
+        guard canChangeSettings, setting.acceptsInput, setting.accepts(value), let expected = setting.current, value != expected,
+              let serial = settings?.device_serial else { return }
         settingsNeedRefresh = true
-        guard await perform(AppStrings.format("Applying %@", setting.displayLabel), executable: core, arguments: ["set-setting", setting.id, String(expected), String(value)]) != nil else { return }
+        guard await perform(AppStrings.format("Applying %@", setting.displayLabel), executable: core, arguments: ["set-setting", setting.id, String(expected), String(value), "--device-serial", serial]) != nil else { return }
         await refreshSettings()
     }
     func setupAction(_ command: String) async {
@@ -352,7 +371,7 @@ struct NativeCommandRunner: AppCommandRunning {
             actionDetails = installationDetails
             return
         }
-        if await perform(AppStrings.text("Submitting PDF to the print queue"), executable: URL(fileURLWithPath: "/usr/bin/lp"), arguments: ["-d", "Evolis_Avansia", "-n", String(copies), "-o", "sides=" + sides, "-o", "print-scaling=" + scaling, "-o", "media=iso_id-1_53.98x85.6mm", url.path]) != nil {
+        if await perform(AppStrings.text("Submitting PDF to the print queue"), executable: URL(fileURLWithPath: "/usr/bin/lp"), arguments: ["-h", "/private/var/run/cupsd", "-d", "Evolis_Avansia", "-n", String(copies), "-o", "sides=" + sides, "-o", "print-scaling=" + scaling, "-o", "media=iso_id-1_53.98x85.6mm", url.path]) != nil {
             notice = AppStrings.text("The PDF was submitted to the queue. Check Print Center for job status.")
         }
     }

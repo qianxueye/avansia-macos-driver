@@ -1,7 +1,7 @@
 import Foundation
 
 func decodeDeviceStatus(_ info:[UInt8],_ status:[UInt8]) throws -> [String:Any] {
-    try require(info.count>=51 && status.count>=60,"Printer information response is incomplete")
+    guard info.count>=51 && status.count>=60 else { throw DeviceAccessFailure(connection:"error",description:"Printer information response is incomplete") }
     let flags=status[0]
     func ascii(_ range:Range<Int>) -> String { String(bytes:info[range],encoding:.ascii)?.trimmingCharacters(in:.whitespacesAndNewlines) ?? "" }
     // Byte offsets follow avansia_status_info2_t in the native vendor header.

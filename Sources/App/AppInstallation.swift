@@ -38,8 +38,10 @@ struct AppInstallationProbe {
         }
     }
     private let setup: URL
+    private let agentFile: URL
     private let runner: any AppCommandRunning
-    init(setup: URL, runner: any AppCommandRunning = NativeCommandRunner()) { self.setup = setup; self.runner = runner }
+    init(setup: URL, agentFile: URL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/LaunchAgents/local.avansia.ipp.plist"),
+         runner: any AppCommandRunning = NativeCommandRunner()) { self.setup = setup; self.agentFile = agentFile; self.runner = runner }
     func inspect() async -> AppInstallationResult {
         let endpoint = "ipp://localhost:18631/ipp/print"
         let service = "local.avansia.ipp"
@@ -57,10 +59,12 @@ struct AppInstallationProbe {
                 return AppInstallationResult(state: .unknown, details: "Service inspection failed (launchctl exit \(serviceResult.status)).")
             }
             let queueOwned = queue.exists && queue.device_uri == endpoint
+            let agentPresent = FileManager.default.fileExists(atPath: agentFile.path)
             let state: AppInstallationState = queueOwned && servicePresent ? .installed
-                : !queue.exists && !servicePresent ? .notInstalled : .incomplete
+                : !queue.exists && !servicePresent && !agentPresent ? .notInstalled : .incomplete
             let details = "Queue Evolis_Avansia: " + (queue.exists ? queue.device_uri ?? "present; endpoint unavailable" : "absent")
                 + "\nUser service local.avansia.ipp: " + (servicePresent ? "loaded" : "absent")
+                + "\nLaunchAgent configuration: " + (agentPresent ? "present" : "absent")
             return AppInstallationResult(state: state, details: details)
         } catch {
             if case AppFailure.timedOut = error {

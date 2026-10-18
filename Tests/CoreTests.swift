@@ -19,6 +19,8 @@ final class SyntheticDevice:DeviceTransport {
     var nodes:[String:[UInt8]]=[:], replies:[[UInt8]]=[], writes:[[UInt8]]=[]
     var statusCalls=0, ribbonCalls=0, failWrite=false, badACK=false, ignoreWrite=false, wrongHeader=false
     var beforeStatus:(() -> Void)?
+    var readFailure:DeviceAccessFailure?, ribbonFailure:Error?
+    var statusPayload:([UInt8],[UInt8])?
     init() {
         nodes["USER"]=syntheticMenu(1,"",1,extra:syntheticChild("User Mode",2))
         nodes["SERV"]=syntheticMenu(11,"",1,extra:syntheticChild("User Mode",2)+syntheticChild("Service Mode",12))
@@ -52,12 +54,13 @@ final class SyntheticDevice:DeviceTransport {
         else { replies += [[28,wrongHeader ? 0x15 : 0x4e]+be32(value.count),value] }
     }
     func read(_ size:Int,timeout:UInt32) throws -> [UInt8] {
+        if let readFailure { throw readFailure }
         try coreCheck(!replies.isEmpty,"Missing response")
         let value=replies.removeFirst();try coreCheck(value.count==size,"Response bounds")
         return value
     }
-    func status() throws -> [String:Any] { statusCalls+=1;beforeStatus?();return state }
-    func ribbonStatus() throws -> [String:Any] { ribbonCalls+=1;return ["ribbon":["code":"TEST-RIBBON","label":"Synthetic YMCK","zone":"TEST"]] }
+    func status() throws -> [String:Any] { statusCalls+=1;beforeStatus?();if let statusPayload { return try decodeDeviceStatus(statusPayload.0,statusPayload.1) };return state }
+    func ribbonStatus() throws -> [String:Any] { ribbonCalls+=1;if let ribbonFailure { throw ribbonFailure };return ["ribbon":["code":"TEST-RIBBON","label":"Synthetic YMCK","zone":"TEST"]] }
     var writeCount:Int { writes.filter{$0[1]==0x4f}.count }
 }
 @main struct CoreTests {
@@ -65,6 +68,16 @@ final class SyntheticDevice:DeviceTransport {
         let temporary=FileManager.default.temporaryDirectory.appendingPathComponent("avansia-core-tests-"+UUID().uuidString)
         try FileManager.default.createDirectory(at:temporary,withIntermediateDirectories:false)
         defer { try? FileManager.default.removeItem(at:temporary) }
+        let previousServer=ProcessInfo.processInfo.environment["CUPS_SERVER"]
+        setenv("CUPS_SERVER","conflicting-scheduler.invalid:8631",1)
+        defer { if let previousServer { setenv("CUPS_SERVER",previousServer,1) } else { unsetenv("CUPS_SERVER") } }
+        var queueArguments=[String]()
+        let localPending=try deviceQueuePending { arguments in
+            queueArguments=arguments
+            return "Evolis_Avansia-123 synthetic 1 test\n"
+        }
+        try coreCheck(localPending && queueArguments==["-h","/private/var/run/cupsd","-W","not-completed","-o"],"Queue check must explicitly pin local scheduler despite conflicting CUPS_SERVER")
+        try coreCheck(try !deviceQueuePending{_ in "Other_Printer-1 synthetic 1 test\n"},"Unrelated local queues must not block this device")
         let fake=SyntheticDevice(), base=temporary.appendingPathComponent("driver")
         var now=Date(timeIntervalSince1970:1000), opens=0, pending=false
         let manager=DeviceManager(base:base,factory:{opens+=1;return fake},pending:{pending},clock:{now})
@@ -94,6 +107,39 @@ final class SyntheticDevice:DeviceTransport {
         try coreCheck((detailed["device"] as! [String:Any])["total_count"] as? Int==1234,"Numeric total comes from USER display")
         _=try manager.snapshot()
         try coreCheck((manager.store.read("status.json")["device"] as! [String:Any])["total_count"] as? Int==1234,"Cheap status retains cached detail total")
+        for stage in ["menu", "rfid", "header", "short-info", "short-status"] {
+            let device=SyntheticDevice(), failureBase=temporary.appendingPathComponent("detail-failure-"+stage)
+            var instant=Date(timeIntervalSince1970:2000)
+            let monitor=DeviceManager(base:failureBase,factory:{device},pending:{false},clock:{instant})
+            let cached=try monitor.snapshot(refreshDetails:true)
+            instant=Date(timeIntervalSince1970:2100)
+            if stage=="menu" { device.readFailure=DeviceAccessFailure(connection:"disconnected",description:"Injected USB disconnect") }
+            if stage=="rfid" { device.ribbonFailure=DeviceAccessFailure(connection:"error",description:"Injected USB timeout") }
+            if stage=="header" { device.wrongHeader=true }
+            if stage.hasPrefix("short-") {
+                device.beforeStatus={
+                    if device.statusCalls==4 {
+                        // Complete response frames may declare a short required payload.
+                        device.statusPayload=([UInt8](repeating:0,count:stage=="short-info" ? 50 : 52),[UInt8](repeating:0,count:stage=="short-status" ? 59 : 60))
+                    }
+                }
+            }
+
+            let failed=try monitor.snapshot(refreshDetails:true)
+            try coreCheck(failed["stale"] as? Bool==true && failed["connection"] as? String==(stage=="menu" ? "disconnected" : "error"),"Detail transport failure must not report fresh Ready")
+            try coreCheck(failed["observed_at"] as? String==cached["observed_at"] as? String && failed["details_observed_at"] as? String==cached["details_observed_at"] as? String,"Failed refresh must retain earlier observation timestamps")
+            try coreCheck(failed["error"] is String && device.writeCount==0,"Read failure is observable without setting writes")
+            try coreCheck(device.statusCalls==(stage=="rfid" || stage.hasPrefix("short-") ? 4 : 3),"Failed transport must not trigger a speculative follow-up status query")
+            if stage.hasPrefix("short-") { try coreCheck(device.ribbonCalls==1 && !device.writes.isEmpty,"Short post-menu status must stop before RFID or further traffic") }
+        }
+        let coldFailure=SyntheticDevice();coldFailure.readFailure=DeviceAccessFailure(connection:"disconnected",description:"Injected disconnect")
+        let coldMonitor=DeviceManager(base:temporary.appendingPathComponent("cold-detail-failure"),factory:{coldFailure},pending:{false})
+        let cold=try coldMonitor.snapshot(refreshDetails:true)
+        try coreCheck(cold["observed_at"] is NSNull && cold["stale"] as? Bool==true && cold["connection"] as? String=="disconnected","Initial Ready must not become an observation after detail transport fails")
+        let metadata=SyntheticDevice();metadata.ribbonFailure=Failure("Ribbon metadata is unavailable")
+        let metadataMonitor=DeviceManager(base:temporary.appendingPathComponent("metadata-unavailable"),factory:{metadata},pending:{false})
+        let metadataState=try metadataMonitor.snapshot(refreshDetails:true)
+        try coreCheck(metadataState["connection"] as? String=="ready" && metadataState["stale"] as? Bool==false && metadataState["error"] as? String=="Ribbon metadata is unavailable","Metadata unavailability is distinct from transport failure")
         fake.state["serial"]="SYN00002"
         let replaced=try manager.snapshot()
         try coreCheck((replaced["ribbon"] as! [String:Any])["reference"]==nil && (replaced["accessories"] as! [[String:Any]]).isEmpty,"Printer change invalidates identity")
@@ -107,29 +153,35 @@ final class SyntheticDevice:DeviceTransport {
         try coreCheck(entries.first{$0["id"] as? String=="service.black-quality"}?["current"] as? Int==1,"SERV chooses Service Mode, not User Mode")
         try coreCheck(!fake.writes.contains{Array($0[6..<14]).first==19},"Action Check sibling must never be traversed")
         try coreCheck(entries.filter{$0["writable"] as? Bool==true}.count==2,"Unknown/actions are read-only")
+        for serial in ["SYN00001", "", "   "] {
+            let requests=fake.writes.count
+            try coreReject{_=try manager.setSetting("image.sharpness",expected:0,value:1,expectedSerial:serial)}
+            try coreReject{_=try manager.setSetting("image.sharpness",expected:0,value:0,expectedSerial:serial)}
+            try coreCheck(fake.writes.count==requests && !manager.store.settingUncertain,"Wrong or empty expected identity must reject before discovery, including no-op")
+        }
         let before=fake.writeCount
-        let unchanged=try manager.setSetting("image.sharpness",expected:0,value:0)
+        let unchanged=try manager.setSetting("image.sharpness",expected:0,value:0,expectedSerial:"SYN00002")
         try coreCheck(unchanged["changed"] as? Bool==false && fake.writeCount==before,"No-op must not send O")
-        let changed=try manager.setSetting("image.sharpness",expected:0,value:-2)
+        let changed=try manager.setSetting("image.sharpness",expected:0,value:-2,expectedSerial:"SYN00002")
         try coreCheck(changed["readback_verified"] as? Bool==true && fake.writeCount==before+1 && !manager.store.settingUncertain,"Write once and verify exact readback")
         try coreCheck(Array(fake.writes.last(where:{$0[1]==0x4f})!.suffix(2))==[255,254],"Signed current encoding")
-        try coreReject{_=try manager.setSetting("image.sharpness",expected:0,value:1)}
-        try coreReject{_=try manager.setSetting("image.sharpness",expected:-2,value:3)}
-        try coreReject{_=try manager.setSetting("raw.01020304",expected:0,value:1)}
+        try coreReject{_=try manager.setSetting("image.sharpness",expected:0,value:1,expectedSerial:"SYN00002")}
+        try coreReject{_=try manager.setSetting("image.sharpness",expected:-2,value:3,expectedSerial:"SYN00002")}
+        try coreReject{_=try manager.setSetting("raw.01020304",expected:0,value:1,expectedSerial:"SYN00002")}
         let afterRejections=fake.writeCount
         fake.badACK=true
-        try coreReject{_=try manager.setSetting("image.sharpness",expected:-2,value:1)}
+        try coreReject{_=try manager.setSetting("image.sharpness",expected:-2,value:1,expectedSerial:"SYN00002")}
         try coreCheck(fake.writeCount==afterRejections+1 && manager.store.settingUncertain,"ACK failure must preserve uncertainty guard")
-        try coreReject{_=try manager.setSetting("image.sharpness",expected:1,value:0)}
+        try coreReject{_=try manager.setSetting("image.sharpness",expected:1,value:0,expectedSerial:"SYN00002")}
         try coreCheck(fake.writeCount==afterRejections+1,"Uncertain write cannot be retried")
         fake.badACK=false;_=try manager.settings()
         try coreCheck(!manager.store.settingUncertain,"Explicit fresh settings read clears guard")
         fake.ignoreWrite=true
-        try coreReject{_=try manager.setSetting("image.sharpness",expected:1,value:0)}
+        try coreReject{_=try manager.setSetting("image.sharpness",expected:1,value:0,expectedSerial:"SYN00002")}
         try coreCheck(manager.store.settingUncertain,"Readback mismatch keeps guard")
         fake.ignoreWrite=false;_=try manager.settings()
         fake.failWrite=true
-        try coreReject{_=try manager.setSetting("image.sharpness",expected:1,value:0)}
+        try coreReject{_=try manager.setSetting("image.sharpness",expected:1,value:0,expectedSerial:"SYN00002")}
         try coreCheck(manager.store.settingUncertain,"Partial write keeps guard, no rollback")
         fake.failWrite=false;_=try manager.settings()
         fake.nodes["14"]=syntheticMenu(14,"Print Quality Bk",3,0,1,1,extra:syntheticChoice("OTHER")+syntheticChoice("UNKNOWN"))
@@ -147,12 +199,12 @@ final class SyntheticDevice:DeviceTransport {
         }
         let late=SyntheticDevice()
         let lateManager=DeviceManager(base:temporary.appendingPathComponent("late-queue"),factory:{late},pending:{!late.writes.isEmpty})
-        try coreReject{_=try lateManager.setSetting("image.sharpness",expected:0,value:1)}
+        try coreReject{_=try lateManager.setSetting("image.sharpness",expected:0,value:1,expectedSerial:"SYN00001")}
         try coreCheck(late.writeCount==0,"A queue arriving during discovery must prevent O")
         let swapped=SyntheticDevice()
         swapped.beforeStatus={ if swapped.statusCalls==2 { swapped.state["serial"]="SYN99999" } }
         let swapManager=DeviceManager(base:temporary.appendingPathComponent("swapped"),factory:{swapped},pending:{false})
-        try coreReject{_=try swapManager.setSetting("image.sharpness",expected:0,value:1)}
+        try coreReject{_=try swapManager.setSetting("image.sharpness",expected:0,value:1,expectedSerial:"SYN00001")}
         try coreCheck(swapped.writeCount==0,"Printer identity change must prevent O")
         try coreReject{_=try MenuDescriptor(selector:[1,0,0,0,0,0,0,0],bytes:syntheticMenu(1,"Bad scalar",6,3,2,2))}
         try coreReject{_=try MenuDescriptor(selector:[1,0,0,0,0,0,0,0],bytes:syntheticMenu(1,"Bad choice",3,0,1,0))}
@@ -209,7 +261,7 @@ final class SyntheticDevice:DeviceTransport {
             try waitingStore.journal(["id":"image.sharpness","serial":"SYN00001","expected":0,"target":1,"started_at":deviceISO(now)])
             return waitingDevice
         },pending:{false})
-        do { _=try waiting.setSetting("image.sharpness",expected:0,value:1);throw Failure("Late journal was accepted") }
+        do { _=try waiting.setSetting("image.sharpness",expected:0,value:1,expectedSerial:"SYN00001");throw Failure("Late journal was accepted") }
         catch let error as SettingFailure { try coreCheck(!error.writeAttempted && error.refreshRequired,"Late journal must report refresh required without a write attempt") }
         try coreCheck(waitingDevice.writes.isEmpty && waitingDevice.statusCalls==0 && waitingStore.settingUncertain,"Post-lock uncertainty check must stop before device observation or O")
         let malformed=SyntheticDevice();malformed.wrongHeader=true

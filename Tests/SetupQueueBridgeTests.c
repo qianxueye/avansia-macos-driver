@@ -4,7 +4,7 @@
 #define cupsDoRequest setup_test_request
 #include "../Sources/native-driver/NativeBridge.c"
 #include <assert.h>
-static int mode, connections, requests, closes;
+static int mode, connections, requests, closes, default_query;
 http_t *setup_test_connect(const char *host, int port, http_addrlist_t *addresses, int family,
                           http_encryption_t encryption, int blocking, int msec, int *cancel) {
     assert(!strcmp(host, "/private/var/run/cupsd") && port == 631 && !addresses && family == AF_UNSPEC);
@@ -17,12 +17,17 @@ void setup_test_timeout(http_t *http, double timeout, http_timeout_cb_t callback
 }
 void setup_test_close(http_t *http) { assert(http == (http_t *)1); ++closes; }
 ipp_t *setup_test_request(http_t *http, ipp_t *request, const char *resource) {
-    assert(http == (http_t *)1 && !strcmp(resource, "/printers/Evolis_Avansia"));
-    assert(ippGetOperation(request) == IPP_OP_GET_PRINTER_ATTRIBUTES);
-    ipp_attribute_t *printer = ippFindAttribute(request, "printer-uri", IPP_TAG_URI);
+    assert(http == (http_t *)1);
     ipp_attribute_t *requested = ippFindAttribute(request, "requested-attributes", IPP_TAG_KEYWORD);
-    assert(printer && !strcmp(ippGetString(printer, 0, NULL), "ipp://localhost:631/printers/Evolis_Avansia"));
-    assert(requested && ippGetCount(requested) == 2 && !strcmp(ippGetString(requested, 0, NULL), "printer-name") && !strcmp(ippGetString(requested, 1, NULL), "device-uri"));
+    if (default_query) {
+        assert(!strcmp(resource, "/") && ippGetOperation(request) == IPP_OP_CUPS_GET_DEFAULT);
+        assert(requested && ippGetCount(requested) == 1 && !strcmp(ippGetString(requested, 0, NULL), "printer-name"));
+    } else {
+        assert(!strcmp(resource, "/printers/Evolis_Avansia") && ippGetOperation(request) == IPP_OP_GET_PRINTER_ATTRIBUTES);
+        ipp_attribute_t *printer = ippFindAttribute(request, "printer-uri", IPP_TAG_URI);
+        assert(printer && !strcmp(ippGetString(printer, 0, NULL), "ipp://localhost:631/printers/Evolis_Avansia"));
+        assert(requested && ippGetCount(requested) == 2 && !strcmp(ippGetString(requested, 0, NULL), "printer-name") && !strcmp(ippGetString(requested, 1, NULL), "device-uri"));
+    }
     ++requests;
     ippDelete(request);
     if (mode == 2) return NULL;
@@ -57,6 +62,20 @@ int main(void) {
     mode = 0;
     assert(avansia_queue_uri("Evolis_Avansia", uri, 2, error, sizeof(error)) == -1);
     assert(uri[0] == '\0');
+    default_query = 1;
+    const int default_modes[] = {0, 1, 2, 3, 4, 10, 11, 13, 14, 15};
+    for (size_t i = 0; i < sizeof(default_modes) / sizeof(default_modes[0]); ++i) {
+        mode = default_modes[i];
+        connections = requests = closes = 0;
+        int result = avansia_default_queue(uri, sizeof(uri), error, sizeof(error));
+        assert(result == (mode == 0 || mode == 11 ? 1 : mode == 3 ? 0 : -1));
+        assert(connections == 1 && requests == (mode == 1 ? 0 : 1) && closes == (mode == 1 ? 0 : 1));
+        if (result == 1) assert(!strcmp(uri, mode == 11 ? "Other_Printer" : "Evolis_Avansia"));
+        else assert(uri[0] == '\0');
+    }
+    mode = 0;
+    assert(avansia_default_queue(uri, 2, error, sizeof(error)) == -1 && uri[0] == '\0');
+    puts("PASS: Native scheduler default uses bounded local CUPS-Get-Default; target/other/no-default and transport/auth/malformed/duplicate/truncated responses remain distinct");
     puts("PASS: Native queue identity uses only bounded local Unix-socket Get-Printer-Attributes; exact/foreign URI, explicit not-found, connection/transport/auth errors, missing/duplicate/wrong-type/multiple/empty attributes and exact printer-name and buffer truncation remain distinct");
     return 0;
 }

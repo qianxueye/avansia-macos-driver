@@ -51,11 +51,12 @@ actor InstallationCommandFixture: AppCommandRunning {
         let state = base.appendingPathComponent("state")
         let runtime = base.appendingPathComponent("runtime")
         let package = folder.appendingPathComponent("package")
-        for path in [state, runtime, package] { try FileManager.default.createDirectory(at: path, withIntermediateDirectories: true) }
+        let agentFile = folder.appendingPathComponent("LaunchAgents/local.avansia.ipp.plist")
+        for path in [state, runtime, package, agentFile.deletingLastPathComponent()] { try FileManager.default.createDirectory(at: path, withIntermediateDirectories: true) }
         let timestamp = ISO8601DateFormatter().string(from: Date())
-        func snapshot(connection: String = "ready", stale: Bool = false, observed: Any? = nil, recovery: Bool = false, active: Bool = false) -> [String: Any] {
+        func snapshot(connection: String = "ready", stale: Bool = false, observed: Any? = nil, recovery: Bool = false, active: Bool = false, serial: String? = "SYNTHETIC-A") -> [String: Any] {
             ["schema_version": 1, "updated_at": timestamp, "observed_at": observed ?? timestamp,
-             "connection": connection, "stale": stale, "device": ["model": "Synthetic printer"],
+             "connection": connection, "stale": stale, "device": ["model": "Synthetic printer", "serial": serial.map { $0 as Any } ?? NSNull()],
              "ribbon": ["remaining_percent": NSNull()], "film": ["remaining_percent": 0],
              "accessories": [["id": "test", "name": "Synthetic accessory", "status": "unknown"]],
              "queue": ["active_job": active, "recovery_required": recovery]]
@@ -63,7 +64,7 @@ actor InstallationCommandFixture: AppCommandRunning {
         func write(_ object: [String: Any], to path: URL = state.appendingPathComponent("status.json")) throws {
             try JSONSerialization.data(withJSONObject: object).write(to: path, options: .atomic)
         }
-        let model = UtilityModel(base: base, package: package, fixture: nil)
+        let model = UtilityModel(base: base, package: package, agentFile: agentFile, fixture: nil)
         model.reloadCache()
         try expect(!model.runtimeAvailable && model.cacheError != nil && !model.canReadDetails, "Missing runtime is visible and blocks native commands")
         let helper = URL(fileURLWithPath: CommandLine.arguments[1])
@@ -87,13 +88,19 @@ actor InstallationCommandFixture: AppCommandRunning {
         }
         try write(snapshot())
         let probeRunner = InstallationCommandFixture()
-        let installation = UtilityModel(base: base, package: package, fixture: nil, runner: probeRunner)
+        let installation = UtilityModel(base: base, package: package, agentFile: agentFile, fixture: nil, runner: probeRunner)
         installation.reloadCache()
         await installation.refreshInstallation()
         try expect(installation.runtimeAvailable && installation.installationState == .notInstalled && installation.canInstall && !installation.canPrint && !installation.canUpdate,
                    "Retained runtime with no queue or loaded agent is not installed, permits Install, and blocks Print")
         try expect(!installation.installationDetails.contains("OtherFixture"), "Installation diagnostics do not retain unrelated printer output")
         try expect(installation.canReadDetails, "Retained runtime remains available for explicit diagnostics")
+        try Data("Synthetic orphan configuration".utf8).write(to: agentFile)
+        await installation.refreshInstallation()
+        try expect(installation.installationState == .incomplete && !installation.canInstall && installation.canUninstall && !installation.canPrint,
+                   "Orphan LaunchAgent configuration is incomplete and enables the existing uninstall recovery flow")
+        try FileManager.default.removeItem(at: agentFile)
+        await installation.refreshInstallation()
         await installation.printPDF(folder.appendingPathComponent("never-submitted.pdf"), copies: 1, sides: "one-sided", scaling: "none")
         var probeCalls = await probeRunner.history()
         try expect(probeCalls.filter { $0.1 == ["queue-info"] }.allSatisfy { $0.0 == package.appendingPathComponent("AvansiaSetup").path }, "Default installation probe resolves Setup from the model's injected package")
@@ -101,6 +108,13 @@ actor InstallationCommandFixture: AppCommandRunning {
         try expect(!probeCalls.contains { $0.0 == "/usr/bin/lp" }, "Removed queue is rejected before PDF submission")
         await installation.setupAction("install")
         try expect(installation.installationState == .installed && installation.canPrint && !installation.canInstall, "Successful setup refreshes verified installation state")
+        let previousServer = getenv("CUPS_SERVER").map { String(cString: $0) }
+        setenv("CUPS_SERVER", "remote-fixture.invalid:631", 1)
+        await installation.printPDF(folder.appendingPathComponent("mock-only.pdf"), copies: 2, sides: "two-sided-long-edge", scaling: "fit")
+        if let previousServer { setenv("CUPS_SERVER", previousServer, 1) } else { unsetenv("CUPS_SERVER") }
+        let submissions = await probeRunner.history().filter { $0.0 == "/usr/bin/lp" }
+        try expect(submissions.count == 1 && Array(submissions[0].1.prefix(4)) == ["-h", "/private/var/run/cupsd", "-d", "Evolis_Avansia"],
+                   "PDF submission explicitly pins the local scheduler despite a hostile inherited CUPS_SERVER")
         await installation.setupAction("uninstall")
         try expect(installation.runtimeAvailable && installation.installationState == .notInstalled && installation.canInstall && !installation.canPrint,
                    "Successful uninstall refreshes the UI even when runtime files remain")
@@ -167,10 +181,37 @@ actor InstallationCommandFixture: AppCommandRunning {
         try expect(!FileManager.default.fileExists(atPath: runtime.appendingPathComponent("commands.log").path), "Cache polling never launches Core")
         await model.refreshSettings()
         try expect(model.settings?.settings.count == 1 && model.canChangeSettings, "Explicit settings load produces typed entries")
+        let settingsResponse = runtime.appendingPathComponent("settings-response.json")
+        func writeSettings(serial: String?, stale: Bool, error: String? = nil) throws {
+            var response: [String: Any] = ["schema_version": 1, "stale": stale, "device_serial": serial.map { $0 as Any } ?? NSNull(),
+                                           "settings": [["id": "image.sharpness", "label": "Sharpness", "group": "Image Setup", "type": "scalar", "current": 0, "minimum": -2, "maximum": 2, "choices": [], "writable": true]], "information": []]
+            response["error"] = error
+            try JSONSerialization.data(withJSONObject: response).write(to: settingsResponse)
+        }
+        try writeSettings(serial: "SYNTHETIC-A", stale: true, error: "Synthetic disconnected settings error")
+        await model.refreshSettings()
+        try expect(model.actionError != nil && model.actionDetails == "Synthetic disconnected settings error" && model.settings?.settings.count == 1 && model.settingsNeedRefresh && !model.canChangeSettings,
+                   "Successful stale settings JSON displays its error and leaves cached settings read-only")
+        try FileManager.default.removeItem(at: settingsResponse)
+        await model.refreshSettings()
+        let observedSetting = model.settings!.settings[0]
+        try write(snapshot(serial: "SYNTHETIC-B")); model.reloadCache()
+        let beforeIdentityChange = try String(contentsOf: runtime.appendingPathComponent("commands.log"), encoding: .utf8)
+        await model.apply(observedSetting, value: 1)
+        let afterIdentityChange = try String(contentsOf: runtime.appendingPathComponent("commands.log"), encoding: .utf8)
+        try expect(model.settings?.device_serial == "SYNTHETIC-A" && model.settingsNeedRefresh && !model.canChangeSettings && beforeIdentityChange == afterIdentityChange,
+                   "Printer B cannot apply settings observed on printer A")
+        try write(snapshot()); model.reloadCache()
+        try expect(!model.canChangeSettings, "Returning to printer A does not bypass the required explicit settings refresh")
+        try writeSettings(serial: nil, stale: false)
+        await model.refreshSettings()
+        try expect(!model.canChangeSettings && model.settingsNeedRefresh, "Settings without a device identity remain read-only")
+        try FileManager.default.removeItem(at: settingsResponse)
+        await model.refreshSettings()
         await model.apply(model.settings!.settings[0], value: 1)
         try expect(model.actionError == AppStrings.text("The setting result is uncertain. Read settings again before another change.") && model.actionDetails?.contains("uncertain") == true && model.settingsNeedRefresh && !model.canChangeSettings, "Failed setting has localized context and preserves technical details and explicit-refresh safety")
         let commandLog = try String(contentsOf: runtime.appendingPathComponent("commands.log"), encoding: .utf8)
-        try expect(commandLog.contains("set-setting image.sharpness 0 1"), "Setting write includes logical ID and expected old value")
+        try expect(commandLog.contains("set-setting image.sharpness 0 1 --device-serial SYNTHETIC-A"), "Setting write includes logical ID, expected old value, and observed device identity")
         await model.apply(model.settings!.settings[0], value: 1)
         let unchangedLog = try String(contentsOf: runtime.appendingPathComponent("commands.log"), encoding: .utf8)
         try expect(commandLog == unchangedLog, "Uncertain write cannot auto retry")
@@ -188,8 +229,8 @@ actor InstallationCommandFixture: AppCommandRunning {
         try expect(model.actionError == AppStrings.text("The recovery record was not cleared. Confirm physical inspection and resolve queued jobs before trying again.") && model.inspected && model.snapshot?.recoveryRequired == true, "Recovery failure gives localized next steps without clearing inspection or uncertainty state")
         let fixture = folder.appendingPathComponent("fixture.json")
         try write(["runtime_available": true, "snapshot": snapshot()], to: fixture)
-        let preview = UtilityModel(base: folder.appendingPathComponent("absent"), package: package, fixture: fixture,
-                                   runner: probeRunner, installationProbe: AppInstallationProbe(setup: package.appendingPathComponent("AvansiaSetup"), runner: probeRunner))
+        let preview = UtilityModel(base: folder.appendingPathComponent("absent"), package: package, agentFile: agentFile, fixture: fixture,
+                                   runner: probeRunner, installationProbe: AppInstallationProbe(setup: package.appendingPathComponent("AvansiaSetup"), agentFile: agentFile, runner: probeRunner))
         preview.reloadCache(); preview.reloadCache()
         try expect(preview.runtimeAvailable && !preview.commandsAllowed, "Fixture mode remains stable and forbids live commands")
         let beforeFixtureProbe = await probeRunner.history().count
@@ -201,6 +242,6 @@ actor InstallationCommandFixture: AppCommandRunning {
             _ = try await NativeCommandRunner().run(helper, ["sleep"], timeout: 0.1)
             throw AppFailure.message("Test failed: timeout was accepted")
         } catch { try expect(error.localizedDescription.contains("timed out"), "Command timeout is reported") }
-        print("PASS: explicit child environment (not an output-language guarantee), unchanged zh-Hans UI, structured native queue information, injected bundled Setup path, retained-runtime separation, verified endpoint/service, setup refresh, malformed/error print gates, nonoverlapping read-only probes, fixture isolation, status/recovery/settings safety, responsive commands and timeouts")
+        print("PASS: stale settings error visibility, device-bound settings invalidation and apply arguments, orphan-agent recovery, explicit local print scheduler, structured queue information, retained-runtime separation, malformed/error print gates, nonoverlapping probes, zh-Hans UI, fixture isolation and command safety")
     }
 }

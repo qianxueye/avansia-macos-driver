@@ -22,15 +22,21 @@ func deviceIPPLine(_ snapshot:[String:Any]) -> String {
     }
     return "AVANSIA_STATUS_V1 \(states.contains(state) ? state : "unknown") \(percent("ribbon")) \(percent("film"))"
 }
-func deviceQueuePending() throws -> Bool {
+func deviceQueueOutput(_ arguments:[String]) throws -> String {
     let process=Process(), pipe=Pipe()
     process.executableURL=URL(fileURLWithPath:"/usr/bin/lpstat")
-    process.arguments=["-W","not-completed","-o"]
+    process.arguments=arguments
     process.standardOutput=pipe; process.standardError=pipe
     try process.run()
     let data=pipe.fileHandleForReading.readDataToEndOfFile(); process.waitUntilExit()
     try require(process.terminationStatus==0,"Cannot inspect the local print queue")
-    return String(decoding:data,as:UTF8.self).split(separator:"\n").contains{$0.hasPrefix("Evolis_Avansia-")}
+    return String(decoding:data,as:UTF8.self)
+}
+func deviceQueuePending(run:([String]) throws -> String) throws -> Bool {
+    try run(["-h","/private/var/run/cupsd","-W","not-completed","-o"]).split(separator:"\n").contains{$0.hasPrefix("Evolis_Avansia-")}
+}
+func deviceQueuePending() throws -> Bool {
+    try deviceQueuePending(run:deviceQueueOutput)
 }
 func openMonitoredDevice() throws -> DeviceTransport {
     do { return try USB() }
@@ -202,7 +208,8 @@ final class DeviceManager {
                     try require(fresh["serial"] as? String==hardware["serial"] as? String,"Printer changed during detail refresh")
                     let ribbon=try transport.ribbonStatus();identity=ribbon["ribbon"] as? [String:Any]
                     resolution=try reconcileSetting(fresh,details!)
-                } catch { detailError=String(describing:error) }
+                } catch let error as DeviceAccessFailure { throw error }
+                catch { detailError=String(describing:error) }
             }
             return try updateStatus(hardware,connection:connection(hardware),stale:false,queue:current,error:detailError,details:details,ribbonIdentity:identity,settingResolution:resolution)
         } catch {
@@ -239,15 +246,16 @@ final class DeviceManager {
             return cached
         }
     }
-    func setSetting(_ id:String,expected:Int,value:Int) throws -> [String:Any] {
+    func setSetting(_ id:String,expected:Int,value:Int,expectedSerial:String) throws -> [String:Any] {
         var attempted=false
         do {
+            try require(!expectedSerial.trimmingCharacters(in:.whitespacesAndNewlines).isEmpty,"Expected printer serial is required")
             try require(SettingRule.all.contains{$0.id==id},"Unknown or read-only logical setting ID")
             try require(!store.settingUncertain,"Refresh settings explicitly before another write")
             _=try idle();let transport=try factory();_=try idle()
             try require(!store.settingUncertain,"Refresh settings explicitly before another write")
             let state=try transport.status();try ready(state)
-            try require(!(state["serial"] as? String ?? "").trimmingCharacters(in:.whitespacesAndNewlines).isEmpty,"Cannot write a setting without an observed printer serial")
+            try require(state["serial"] as? String==expectedSerial,"Printer identity differs from the observed settings; refresh settings before applying")
             let menu=DeviceMenu(transport), discovery=try menu.discover()
             let matches=discovery.settings.filter{$0.rule?.id==id}
             try require(matches.count==1,"Requested writable setting is unavailable")
@@ -255,7 +263,7 @@ final class DeviceManager {
                 _=try self.idle()
                 try require(!self.store.settingUncertain,"Refresh settings explicitly before another write")
                 let fresh=try transport.status();try self.ready(fresh)
-                try require(fresh["serial"] as? String==state["serial"] as? String,"Printer changed during setting discovery")
+                try require(fresh["serial"] as? String==expectedSerial,"Printer changed during setting discovery")
             },willWrite:{ _ in
                 try self.store.journal(["id":id,"serial":state["serial"] ?? NSNull(),"expected":expected,"target":value,"started_at":deviceISO(self.clock())])
                 attempted=true

@@ -13,8 +13,13 @@ case "locale":
     let result = ["LC_ALL": environment["LC_ALL"] ?? "", "LANG": environment["LANG"] ?? ""]
     FileHandle.standardOutput.write(try JSONSerialization.data(withJSONObject: result))
 case "settings":
+    let response = root.appendingPathComponent("settings-response.json")
+    if FileManager.default.fileExists(atPath: response.path) {
+        FileHandle.standardOutput.write(try Data(contentsOf: response))
+        exit(0)
+    }
     print("""
-    {"schema_version":1,"stale":false,"settings":[{"id":"image.sharpness","label":"Sharpness","group":"Image Setup","type":"scalar","current":0,"minimum":-2,"maximum":2,"choices":[],"writable":true}],"information":[]}
+    {"schema_version":1,"stale":false,"device_serial":"SYNTHETIC-A","settings":[{"id":"image.sharpness","label":"Sharpness","group":"Image Setup","type":"scalar","current":0,"minimum":-2,"maximum":2,"choices":[],"writable":true}],"information":[]}
     """)
 case "set-setting":
     FileHandle.standardError.write(Data("Simulated uncertain setting outcome; refresh required.\n".utf8)); exit(7)

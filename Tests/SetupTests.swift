@@ -5,6 +5,12 @@ let setupTestHome = FileManager.default.temporaryDirectory.appendingPathComponen
 
 struct MockSetup {
     var queueURI: String?
+    var serverDefault: String?
+    var defaultQueryError = false
+    var defaultReadbackError = false
+    var defaultChanges = 0
+    var failDefaultChange = false
+    var ignoreDefaultChange = false
     var queryError = false
     var localizedQueueOutput = false
     var loaded = false
@@ -37,17 +43,31 @@ func testWrite(_ text: String, _ url: URL) throws {
     try text.write(to: url, atomically: true, encoding: .utf8)
 }
 
-func setupTestRun(_ executable: String, _ args: [String], _ checked: Bool) throws -> (Int32, String) {
+func setupTestRun(_ executable: String, _ incoming: [String], _ checked: Bool) throws -> (Int32, String) {
     let name = URL(fileURLWithPath: executable).lastPathComponent
+    let args: [String]
+    if ["lpstat", "lpoptions", "lpadmin", "cupsaccept", "cupsreject", "cupsenable", "cupsdisable"].contains(name) {
+        guard incoming.count >= 2 && incoming[0] == "-h" && incoming[1] == "/private/var/run/cupsd" else {
+            throw SetupError("Test failed: CUPS command was not pinned to the local scheduler: " + name)
+        }
+        args = Array(incoming.dropFirst(2))
+    } else { args = incoming }
     let operation: String
     switch name {
     case "lpadmin":
-        operation = args.contains("-x") ? "delete-queue" : args.contains("everywhere") ? "create-queue" : args.contains("-P") ? "set-ppd" : "defaults"
+        operation = args.contains("-d") ? "set-default" : args.contains("-x") ? "delete-queue" : args.contains("everywhere") ? "create-queue" : args.contains("-P") ? "set-ppd" : "defaults"
     case "launchctl": operation = args[0]
     default: operation = name
     }
     mock.calls.append(operation)
     if operation == "defaults" { mock.configuredDefaults = args }
+    if operation == "set-default" {
+        try expectSetup(args == ["-d", queue], "Only the original target default may be restored")
+        mock.defaultChanges += 1
+        if mock.failDefaultChange { throw SetupError("Injected server default restoration failure") }
+        if !mock.ignoreDefaultChange { mock.serverDefault = queue }
+        return (0, "")
+    }
     // Creation can mutate CUPS successfully before the command reports failure.
     if operation == "create-queue" {
         mock.queueURI = uri
@@ -97,6 +117,7 @@ func setupTestRun(_ executable: String, _ args: [String], _ checked: Bool) throw
     case "lpadmin":
         if operation == "delete-queue" {
             mock.queueURI = nil
+            if mock.serverDefault == queue { mock.serverDefault = nil }
             try? FileManager.default.removeItem(at: queuePPD())
         } else if let index = args.firstIndex(of: "-P") {
             let data = try Data(contentsOf: URL(fileURLWithPath: args[index + 1]))
@@ -112,6 +133,14 @@ func setupTestRun(_ executable: String, _ args: [String], _ checked: Bool) throw
     default: throw SetupError("Unexpected command: " + executable)
     }
     return (0, "")
+}
+
+func setupTestDefaultQueue() throws -> String? {
+    mock.calls.append("default-query")
+    if mock.defaultQueryError || (mock.defaultReadbackError && mock.defaultChanges > 0) {
+        throw SetupError("Injected server default query failure")
+    }
+    return mock.serverDefault
 }
 
 func setupTestQueueURI() throws -> String? {
@@ -207,7 +236,7 @@ func assertPreviousInstallation(accepting: Bool, paused: Bool, loaded: Bool = tr
         try test("Native ownership ignores localized human output and requires exact device URI") {
             try resetSetup(installed: true)
             mock.localizedQueueOutput = true; mock.failure = "defaults"
-            let human = try setupTestRun("/usr/bin/lpstat", ["-v", queue], false).1
+            let human = try run("/usr/bin/lpstat", ["-v", queue], checked: false).1
             try expectSetup(human.hasPrefix("用于"), "Fixture uses the actual Chinese macOS prefix")
             try expectSetup(ownedQueue(try queueDeviceURI()), "Native exact URI is owned regardless of human language")
             for candidate in [uri + "/", "ipp://127.0.0.1:18631/ipp/print", "ipp://other.invalid/ipp/print"] {
@@ -352,6 +381,75 @@ func assertPreviousInstallation(accepting: Bool, paused: Bool, loaded: Bool = tr
             try expectFailure("prior queue acceptance or paused state was not restored") { try upgrade(source) }
             try expectSetup(mock.queueURI == uri && mock.loaded, "Old queue/service remain available when readback detects incomplete recovery")
             try assertOldRuntime()
+        }
+        for rollback in [false, true] {
+            try test("Upgrade preserves target server default, rollback=\(rollback)") {
+                try resetSetup(installed: true)
+                mock.serverDefault = queue
+                if rollback { mock.failure = "defaults" }
+                if rollback {
+                    try expectFailure("prior installation was restored") { try upgrade(source) }
+                    try assertPreviousInstallation(accepting: true, paused: false)
+                } else {
+                    try upgrade(source)
+                    try expectSetup(mock.queueURI == uri && mock.loaded && mock.accepting, "Successful upgrade remains installed")
+                    try assertProfile()
+                }
+                try expectSetup(mock.serverDefault == queue && mock.defaultChanges == 1, "Deleted target default is restored and read back")
+            }
+        }
+        for previous in [nil, "Other_Printer"] as [String?] {
+            for rollback in [false, true] {
+                try test("Upgrade preserves other or explicit no-default state, previous=\(previous ?? "none"), rollback=\(rollback)") {
+                    try resetSetup(installed: true)
+                    mock.serverDefault = previous
+                    if rollback { mock.failure = "defaults" }
+                    if rollback { try expectFailure("prior installation was restored") { try upgrade(source) } }
+                    else { try upgrade(source) }
+                    try expectSetup(mock.serverDefault == previous && mock.defaultChanges == 0, "Unrelated or absent server default is never reassigned")
+                    try assertProfile()
+                }
+            }
+        }
+        try test("Unknown server default refuses upgrade before staging or mutation") {
+            try resetSetup(installed: true)
+            mock.defaultQueryError = true
+            try expectFailure("server default query failure") { try upgrade(source) }
+            try assertPreviousInstallation(accepting: true, paused: false)
+            try expectSetup(!mock.calls.contains("assets") && !mock.calls.contains("cupsreject"), "Server default query errors never become no-default")
+        }
+        for rollback in [false, true] {
+            for failure in ["command", "readback", "query"] {
+                try test("Default restoration failure is incomplete, rollback=\(rollback), failure=\(failure)") {
+                    try resetSetup(installed: true)
+                    mock.serverDefault = queue
+                    if rollback { mock.failure = "defaults" }
+                    mock.failDefaultChange = failure == "command"
+                    mock.ignoreDefaultChange = failure == "readback"
+                    mock.defaultReadbackError = failure == "query"
+                    do {
+                        try upgrade(source)
+                        throw SetupError("Test failed: default restoration unexpectedly succeeded")
+                    } catch {
+                        try expectSetup((error as? SetupError)?.recoveryIncomplete == true, "Default restoration failure propagates incomplete recovery")
+                        try expectSetup(!String(describing: error).contains("prior installation was restored"), "Incomplete default recovery never reports full recovery")
+                    }
+                    try expectSetup(mock.queueURI == uri && mock.loaded, "Usable new or recovered installation is retained after default restoration failure")
+                    if rollback { try assertPreviousInstallation(accepting: true, paused: false) }
+                    else { try expectSetup(try String(contentsOf: runtime.appendingPathComponent("version"), encoding: .utf8) == "new-runtime", "Installed runtime remains intact") }
+                    try assertProfile()
+                }
+            }
+        }
+        try test("All CUPS child commands stay local under hostile CUPS_SERVER") {
+            try resetSetup(installed: true)
+            mock.serverDefault = queue; mock.failure = "defaults"
+            let original = getenv("CUPS_SERVER").map { String(cString: $0) }
+            setenv("CUPS_SERVER", "remote-namesake.invalid:631", 1)
+            defer { if let original { setenv("CUPS_SERVER", original, 1) } else { unsetenv("CUPS_SERVER") } }
+            try expectFailure("prior installation was restored") { try upgrade(source) }
+            try expectSetup(mock.calls.contains("set-default") && mock.calls.contains("delete-queue") && mock.calls.contains("cupsaccept"), "Hostile environment fixture exercises default restoration, deletion and acceptance; every mock asserts explicit local -h")
+            try assertPreviousInstallation(accepting: true, paused: false)
         }
         try test("Failed upgrade preserves registered but unloaded prior service plist") {
             try resetSetup(installed: true)
