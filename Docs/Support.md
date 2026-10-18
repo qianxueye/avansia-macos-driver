@@ -18,7 +18,7 @@ device completion and physical quality acceptance are different evidence.
 | Accessories | Reported magnetic encoder, chip ports and external box presence | Discovery/readback only; absent hardware functionality unverified |
 | Printer/image/card/heater settings | Discovered allowlisted typed values and verified black-quality choice | Fresh descriptor/expected-value validation, one write, exact readback |
 | Recovery | Retained stopped task, uncertain-card inspection and setting-write reconciliation | Failure-injection tests; no automatic physical retry |
-| Chinese utility | Overview, supplies, accessories, settings, PDF printing, installation and recovery | Resource/model checks and release UI inspection |
+| Chinese utility | Overview, supplies, accessories, settings, PDF printing, installation and recovery | Packaged resource/model tests; owner confirmed Chinese UI and live supply levels |
 
 ## Not implemented or not verified
 

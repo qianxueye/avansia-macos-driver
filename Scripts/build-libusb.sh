@@ -17,7 +17,7 @@ test "$actual" = "$digest" || { echo 'libusb source download failed its integrit
 tar -xjf "$archive" -C "$source_dir" --strip-components=1
 cd "$source_dir"
 export MACOSX_DEPLOYMENT_TARGET=14.0
-./configure CC='xcrun --sdk macosx clang' CFLAGS='-arch arm64 -mmacosx-version-min=14.0' \
+./configure ac_cv_func_pipe2=no CC='xcrun --sdk macosx clang' CFLAGS='-arch arm64 -mmacosx-version-min=14.0' \
     LDFLAGS='-arch arm64 -mmacosx-version-min=14.0' --disable-static --enable-shared \
     --disable-tests-build --disable-examples-build --prefix="$output" > "$output/configure.log" 2>&1
 make -j4 > "$output/build.log" 2>&1
@@ -26,4 +26,15 @@ install_name_tool -id @rpath/libusb-1.0.dylib "$output/libusb-1.0.dylib"
 codesign --force --sign - "$output/libusb-1.0.dylib"
 cp COPYING "$output/COPYING-libusb.txt"
 codesign --verify --strict "$output/libusb-1.0.dylib"
+nm -u "$output/libusb-1.0.dylib" > "$output/undefined-symbols.txt"
+if grep -Eq '(^|[[:space:]])_pipe2$' "$output/undefined-symbols.txt"; then
+    echo 'libusb must use the portable pipe path for macOS 14 compatibility.' >&2
+    exit 1
+fi
+xcrun --sdk macosx clang -arch arm64 -mmacosx-version-min=14.0 \
+    -Wall -Wextra -I"$source_dir/libusb" "$repository/Tests/LibusbInitialization.c" \
+    -o "$output/libusb-initialization-test"
+"$output/libusb-initialization-test" "$output/libusb-1.0.dylib" \
+    > "$output/initialization.log" 2>&1
+cat "$output/initialization.log"
 otool -L "$output/libusb-1.0.dylib"

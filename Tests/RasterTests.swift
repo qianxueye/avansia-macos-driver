@@ -225,8 +225,9 @@ func queueGate() throws -> [[String: Any]] {
     }
     let queue = "Avansia_Raster_Test_\(ProcessInfo.processInfo.processIdentifier)"
     let uri = "ipp://localhost:18649/ipp/print"
-    let beforeQueues = try checked("/usr/bin/lpstat", ["-v"])
-    let beforeDefault = try checked("/usr/bin/lpstat", ["-d"])
+    // A fresh macOS runner can report no destinations or default with exit status 1.
+    let beforeQueues = try run("/usr/bin/lpstat", ["-v"])
+    let beforeDefault = try run("/usr/bin/lpstat", ["-d"])
     try check(try run("/usr/bin/lpstat", ["-p",queue]).0 != 0,"Refusing to replace an existing test queue")
     let descriptor = Darwin.socket(AF_INET,SOCK_STREAM,0)
     guard descriptor >= 0 else { throw NSError(domain:NSPOSIXErrorDomain,code:Int(errno)) }
@@ -349,8 +350,10 @@ func queueGate() throws -> [[String: Any]] {
                                     "page_ranges":env["IPP_PAGE_RANGES"] ?? "","job_completed":true])
         }
     }
-    try check(try checked("/usr/bin/lpstat",["-v"]) == beforeQueues,"Existing printer device URIs changed")
-    try check(try checked("/usr/bin/lpstat",["-d"]) == beforeDefault,"Default printer changed")
+    let afterQueues = try run("/usr/bin/lpstat",["-v"])
+    let afterDefault = try run("/usr/bin/lpstat",["-d"])
+    try check(afterQueues.0 == beforeQueues.0 && afterQueues.1 == beforeQueues.1 && afterQueues.2 == beforeQueues.2,"Existing printer snapshot changed")
+    try check(afterDefault.0 == beforeDefault.0 && afterDefault.1 == beforeDefault.1 && afterDefault.2 == beforeDefault.2,"Default printer snapshot changed")
     try check(try run("/usr/bin/lpstat",["-p",queue]).0 != 0,"Synthetic queue remains")
     try? FileManager.default.removeItem(at:root.deletingLastPathComponent().appendingPathComponent("test-queue-name"))
     try? FileManager.default.removeItem(at:root.deletingLastPathComponent().appendingPathComponent("test-server-pid"))
