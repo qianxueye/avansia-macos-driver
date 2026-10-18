@@ -156,26 +156,26 @@ final class USB {
     }
     deinit { if handle != nil { close(handle) }; if context != nil { exitUSB(context) }; if lock >= 0 { Darwin.close(lock) }; dlclose(libraryHandle) }
     func write(_ data: [UInt8], timeout: UInt32 = 5000) throws {
-        let rc = claim(handle, 0); try require(rc == 0, "Avansia USB interface is unavailable: \(rc)")
+        let rc = claim(handle, 0); if rc != 0 { throw DeviceAccessFailure(connection:rc == -4 ? "disconnected" : "error",description:"Avansia USB interface is unavailable: \(rc)") }
         defer { _ = release(handle, 0) }
         var offset = 0
         while offset < data.count {
             var chunk = Array(data[offset..<min(data.count, offset + 65536)]), sent: Int32 = 0
             let count = chunk.count
             let rc = chunk.withUnsafeMutableBytes { bulk(handle, 1, $0.baseAddress, Int32(count), &sent, timeout) }
-            try require(rc == 0 && sent == count, "USB write failed: \(rc); accepted \(sent)/\(count) bytes; do not retry a print automatically")
+            if rc != 0 || sent != count { throw DeviceAccessFailure(connection:rc == -4 ? "disconnected" : "error",description:"USB write failed: \(rc); accepted \(sent)/\(count) bytes; do not retry a print automatically") }
             offset += Int(sent)
         }
     }
     func read(_ size: Int, timeout: UInt32 = 5000) throws -> [UInt8] {
         while buffer.count < size {
-            let rc = claim(handle, 0); try require(rc == 0, "Avansia USB interface is unavailable: \(rc)")
+            let rc = claim(handle, 0); if rc != 0 { throw DeviceAccessFailure(connection:rc == -4 ? "disconnected" : "error",description:"Avansia USB interface is unavailable: \(rc)") }
             do {
                 defer { _ = release(handle, 0) }
                 _ = control(handle, 0x21, 1, 0, 0, nil, 0, timeout)
                 var raw = [UInt8](repeating: 0, count: 65536), received: Int32 = 0
                 let rc = raw.withUnsafeMutableBytes { bulk(handle, 0x81, $0.baseAddress, 65536, &received, timeout) }
-                try require((rc == 0 || rc == -7) && received > 0, "USB read failed: \(rc); received \(received) bytes")
+                if !((rc == 0 || rc == -7) && received > 0) { throw DeviceAccessFailure(connection:rc == -4 ? "disconnected" : "error",description:"USB read failed: \(rc); received \(received) bytes") }
                 buffer += raw.prefix(Int(received))
             }
         }
@@ -185,20 +185,17 @@ final class USB {
         try require(command == 89 || command == 84, "Unsupported printer query")
         try write([28,command] + be32(expected))
         let header = try read(6), size = integer(header[2..<6])
-        try require(header[0...1] == [28, command] && size <= 4096, "Unexpected printer response: \(hex(header))")
+        guard header[0...1] == [28, command] && size <= 4096 else { throw DeviceAccessFailure(connection:"error",description:"Unexpected printer response: \(hex(header))") }
         return try read(size)
     }
     func status() throws -> [String: Any] {
         let info = try query(89,52), state = try query(84,60)
-        try require(info.count >= 51 && state.count >= 60, "Printer information response is incomplete")
-        let flags = state[0]
-        func ascii(_ range: Range<Int>) -> String { String(bytes: info[range], encoding: .ascii)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "" }
-        return ["model": "Evolis Avansia", "firmware": ascii(38..<42), "base_revision": ascii(34..<38), "serial": ascii(42..<50), "printer_id": info[50], "ribbon_type_code": info[2], "ribbon_panel_code": info[3], "ribbon_remaining_percent": state[42] <= 100 ? Int(state[42]) as Any : NSNull(), "film_remaining_percent": state[43] <= 100 ? Int(state[43]) as Any : NSNull(), "ready": flags & 0x11 == 0x11 && flags & 4 == 0, "printing": flags & 8 != 0, "error": flags & 4 != 0, "flags": String(format: "%02x", flags), "status_payload": hex(state)]
+        return try decodeDeviceStatus(info,state)
     }
     func send(_ command: UInt8, _ payload: [UInt8]) throws {
         try write([28,command] + be32(payload.count) + payload)
         let ack = try read(6)
-        try require(ack[0...1] == [28,command], "Unexpected RFID transport acknowledgement: \(hex(ack))")
+        guard ack[0...1] == [28,command] else { throw DeviceAccessFailure(connection:"error",description:"Unexpected RFID transport acknowledgement: \(hex(ack))") }
     }
     func exchange(_ opcode: UInt8, _ payload: [UInt8], timeout: Double = 2) throws -> [UInt8] {
         let size = payload.count + 3
@@ -207,14 +204,14 @@ final class USB {
         while ProcessInfo.processInfo.systemUptime < deadline {
             try write([28,68] + be32(1024))
             let header = try read(6, timeout: 250), count = integer(header[2..<6])
-            try require(header[0...1] == [28,68] && count <= 1024, "Unexpected RFID transport response")
+            guard header[0...1] == [28,68] && count <= 1024 else { throw DeviceAccessFailure(connection:"error",description:"Unexpected RFID transport response") }
             let data = try read(count, timeout: 250)
             if data.count >= 2 {
                 let available = Int(Int16(bitPattern: UInt16(data[0]) << 8 | UInt16(data[1])))
                 try require(available >= 0, "RFID interface reported an error: \(available)")
                 if available > 2 && data.count >= 5 {
                     let length = Int(data[3]) | Int(data[4]) << 8
-                    try require(length >= 3 && length <= 1022, "Invalid RFID response length")
+                    guard length >= 3 && length <= 1022 else { throw DeviceAccessFailure(connection:"error",description:"Invalid RFID response length") }
                     if available >= length && data.count >= length + 2 {
                         try require(data[2] == opcode, "RFID details query failed with response code \(data[2])")
                         return Array(data[5..<length + 2])
@@ -223,11 +220,11 @@ final class USB {
             }
             usleep(10000)
         }
-        throw Failure("RFID details read timed out")
+        throw DeviceAccessFailure(connection:"error",description:"RFID details read timed out")
     }
     func ribbonStatus() throws -> [String: Any] {
         let state = try status(), flags = Int(state["flags"] as! String, radix: 16)!
-        try require(state["ready"] as? Bool == true && flags & 0x2a == 0, "The printer must be idle and Ready to read ribbon details")
+        guard state["ready"] as? Bool == true && flags & 0x2a == 0 else { throw DeviceStateFailure(state:state,description:"The printer must be idle and Ready to read ribbon details") }
         var details: [String: String] = [:], activeError: Error?
         do {
             try send(80, Array("\u{1b}E6,4.".utf8)); try send(67, [0,0,2,5]); usleep(60000)
@@ -244,9 +241,26 @@ final class USB {
                 details[field] = plaintext.map { $0 < 128 ? String(UnicodeScalar($0)) : String(format: "\\x%02x", $0) }.joined()
             }
         } catch { activeError = error }
-        do { try send(80, Array("\u{1b}E7,4.".utf8)) } catch { if let activeError { throw Failure("\(activeError); RFID session cleanup also failed: \(error)") }; throw error }
+        if let failure=activeError as? DeviceAccessFailure { throw failure }
+        do { try send(80, Array("\u{1b}E7,4.".utf8)) } catch {
+            if let activeError {
+                let message="\(activeError); RFID session cleanup also failed: \(error)"
+                if let failure=(error as? DeviceAccessFailure) ?? (activeError as? DeviceAccessFailure) {
+                    throw DeviceAccessFailure(connection:failure.connection,description:message)
+                }
+                throw Failure(message)
+            }
+            throw error
+        }
         if let activeError { throw activeError }
-        var result = try status(); result["ribbon"] = details
+        var result = try status()
+        guard result["ready"] as? Bool==true && result["printing"] as? Bool==false && result["error"] as? Bool==false && result["mechanical_busy"] as? Bool != true && result["interface_busy"] as? Bool != true else {
+            throw DeviceStateFailure(state:result,description:"Printer became unavailable during ribbon detail refresh")
+        }
+        guard result["serial"] as? String==state["serial"] as? String else {
+            throw DeviceStateFailure(state:result,description:"Printer changed during ribbon detail refresh")
+        }
+        result["ribbon"] = details
         result["detected_ribbon"] = details["label"] == "Color YMCK RT" ? "YMCK" : details["label"] == "Color YMCKK RT" ? "YMCKK" as Any : NSNull()
         return result
     }
@@ -503,6 +517,7 @@ func prepare(_ front: String, _ output: String, _ ribbon: String, _ back: String
 
 var inheritedLock: Int32? = nil
 var jobURI: String? = nil
+var coreTextOutput:String?
 func checkCancellation() throws -> Bool {
     if avansia_interrupted() != 0 { return true }
     guard let jobURI else { return false }
@@ -522,6 +537,24 @@ func coreMain() throws -> [String: Any] {
     jobURI = try option("--job-uri")
     try require(!args.isEmpty,"Usage: AvansiaCore status|ribbon|prepare FRONTBMP OUTPUTPRN --ribbon YMCK|YMCKK [--back BMP] [--rotate-back] [--front-black MASK --back-black MASK] [--color-profile JSON]|print PRN --confirm-one-card")
     let command = args.removeFirst()
+    if command == "snapshot" {
+        try require(args.isEmpty || args==["--refresh-details"],"Usage: snapshot [--refresh-details]")
+        return try DeviceManager().snapshot(refreshDetails:!args.isEmpty)
+    }
+    if command == "ipp-status" {
+        let value=args.isEmpty ? (try? DeviceManager().snapshot()) ?? ["connection":"unknown"] : ["connection":"unknown"]
+        coreTextOutput=deviceIPPLine(value)
+        return [:]
+    }
+    if command == "settings" {
+        try require(args.isEmpty,"Usage: settings")
+        return try DeviceManager().settings()
+    }
+    if command == "set-setting" {
+        try require(args.count==5 && args[3]=="--device-serial","Usage: set-setting ID EXPECTED VALUE --device-serial SERIAL")
+        guard let expected=Int(args[1]),let value=Int(args[2]) else { throw Failure("Setting values must be integers") }
+        return try DeviceManager().setSetting(args[0],expected:expected,value:value,expectedSerial:args[4])
+    }
     if command == "validate" {
         try require(args.count == 1,"Usage: validate PRN")
         let records = try readJob(args[0]); return ["valid":true,"wire_blocks":records.filter { $0.checkpoint == nil }.count]
@@ -572,7 +605,15 @@ func selfTest() throws -> [String: Any] {
 @main struct CoreEntry {
     static func main() {
         avansia_install_signals()
-        do { emit(try coreMain()) } catch { emit(["error":String(describing:error)]); exit(1) }
+        do {
+            let result=try coreMain()
+            if let text=coreTextOutput { print(text) } else { emit(result) }
+        } catch {
+            if let setting=error as? SettingFailure {
+                emit(["error":setting.description,"write_attempted":setting.writeAttempted,"refresh_required":setting.refreshRequired,"automatic_retries":0])
+            } else { emit(["error":String(describing:error)]) }
+            exit(1)
+        }
     }
 }
 #endif

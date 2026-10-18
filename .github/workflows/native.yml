@@ -1,0 +1,42 @@
+name: Native macOS validation
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  native:
+    runs-on: macos-14
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build native application and private IPP engine
+        env:
+          RELEASE_BUILD: '1'
+        run: Scripts/build.sh
+      - name: Verify protocol, state and installation boundaries
+        run: |
+          Scripts/test-core.sh
+          Scripts/test-print-safety.sh
+          Scripts/test-setup.sh
+          Scripts/test-assets.sh
+          Scripts/test-icons.sh
+          Scripts/test-job-lock.sh
+          Scripts/test-app.sh
+      - name: Verify live IPP supply updates
+        run: |
+          Tests/IPPStatus.sh
+          Tests/IPPStatusIntegration.sh
+      - name: Verify PDF geometry and system queue forwarding
+        run: Scripts/test-raster.sh

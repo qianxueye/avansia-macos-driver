@@ -1,0 +1,31 @@
+{
+  "runtime_available": true,
+  "installation_state": "installed",
+  "snapshot": {
+    "schema_version": 1,
+    "updated_at": "2026-01-01T12:00:00Z",
+    "observed_at": "2026-01-01T12:00:00Z",
+    "connection": "ready",
+    "stale": true,
+    "device": {"model": "Synthetic Avansia", "firmware": "Fixture", "serial": "SYNTHETIC-PREVIEW"},
+    "ribbon": {"remaining_percent": 72, "reference": "SYNTHETIC", "label": "Example YMCK ribbon", "region": "Example", "identity_observed_at": "2026-01-01T12:00:00Z"},
+    "film": {"remaining_percent": null, "type": "Unknown"},
+    "accessories": [
+      {"id": "example.connected", "name": "Connected accessory fixture", "status": "connected"},
+      {"id": "example.disconnected", "name": "Chip port #1", "status": "disconnected"},
+      {"id": "example.unknown", "name": "External Box", "status": "unknown"}
+    ],
+    "queue": {"active_job": false, "recovery_required": false}
+  },
+  "settings": {
+    "schema_version": 1,
+    "stale": true,
+    "device_serial": "SYNTHETIC-PREVIEW",
+    "settings": [
+      {"id": "image.sharpness", "label": "Sharpness", "group": "Image Setup", "type": "scalar", "current": 0, "minimum": -2, "maximum": 2, "choices": [], "writable": true},
+      {"id": "example.choice", "label": "Choice fixture", "group": "Example", "type": "choice", "current": 0, "minimum": 0, "maximum": 1, "choices": [{"value": 0, "label": "First option"}, {"value": 1, "label": "Second option"}], "writable": true},
+      {"id": "example.unknown", "label": "Unavailable setting", "group": "Example", "type": "unknown", "current": null, "minimum": null, "maximum": null, "choices": [], "writable": false}
+    ],
+    "information": [{"label": "Fixture information", "value": "Synthetic data only"}]
+  }
+}
