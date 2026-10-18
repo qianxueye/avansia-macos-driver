@@ -1,0 +1,402 @@
+--- a/tools/ippeveprinter.c
++++ b/tools/ippeveprinter.c
+@@ -223,6 +223,8 @@
+   cups_array_t		*jobs;		/* Jobs */
+   ippeve_job_t		*active_job;	/* Current active/pending job */
+   int			next_job_id;	/* Next job-id value */
++  char                  connection[16];
++  int                   ribbon_level, film_level;
+   _cups_rwlock_t	rwlock;		/* Printer lock */
+ } ippeve_printer_t;
+ 
+@@ -246,6 +248,15 @@
+   int			fd;		/* Print file descriptor */
+   ippeve_printer_t	*printer;	/* Printer */
+ };
++
++typedef struct ippeve_status_s
++{
++  pid_t pid;
++  int fd, failed;
++  double deadline, next_poll;
++  size_t used;
++  char output[256];
++} ippeve_status_t;
+ 
+ typedef struct ippeve_client_s		/**** Client data ****/
+ {
+@@ -344,6 +355,11 @@
+ static void		respond_ignored(ippeve_client_t *client, ipp_attribute_t *attr);
+ static void		respond_ipp(ippeve_client_t *client, ipp_status_t status, const char *message, ...) _CUPS_FORMAT(3, 4);
+ static void		respond_unsupported(ippeve_client_t *client, ipp_attribute_t *attr);
++static void             status_apply(ippeve_printer_t *printer, const char *connection, int ribbon, int film);
++static int              status_parse(const char *output, char *connection, int *ribbon, int *film);
++static double           status_now(void);
++static void             status_stop(ippeve_status_t *probe);
++static void             status_tick(ippeve_printer_t *printer, ippeve_status_t *probe, double now);
+ static void		run_printer(ippeve_printer_t *printer);
+ static int		show_media(ippeve_client_t *client);
+ static int		show_status(ippeve_client_t *client);
+@@ -371,6 +387,7 @@
+ static int		KeepFiles = 0,	/* Keep spooled job files? */
+ 			MaxVersion = 20,/* Maximum IPP version (20 = 2.0, 11 = 1.1, etc.) */
+ 			Verbosity = 0;	/* Verbosity level */
++static const char       *StatusCommand = NULL;
+ static const char	*PAMService = NULL;
+ 					/* PAM service */
+ #ifndef _WIN32
+@@ -439,6 +456,12 @@
+         usage(1);
+ 
+       PAMService = argv[i];
++    }
++    else if (!strcmp(argv[i], "--status-command"))
++    {
++      if (++i >= argc || argv[i][0] != '/' || access(argv[i], X_OK))
++        usage(1);
++      StatusCommand = argv[i];
+     }
+     else if (!strcmp(argv[i], "--version"))
+     {
+@@ -2226,6 +2249,8 @@
+     goto bad_printer;
+   }
+ 
++  if (StatusCommand) status_apply(printer, "unknown", -1, -1);
++
+   if (!register_printer(printer))
+     goto bad_printer;
+ 
+@@ -3866,6 +3891,9 @@
+ {
+   cups_array_t		*ra;		/* Requested attributes array */
+   ippeve_printer_t	*printer;	/* Printer */
++  ipp_pstate_t display_state;
++  ippeve_preason_t display_reasons;
++  const char *hardware_message = NULL;
+ 
+ 
+  /*
+@@ -3878,6 +3906,30 @@
+   respond_ipp(client, IPP_STATUS_OK, NULL);
+ 
+   _cupsRWLockRead(&(printer->rwlock));
++  display_state = printer->state;
++  display_reasons = printer->state_reasons;
++  if (StatusCommand && !printer->active_job && printer->state != IPP_PSTATE_STOPPED)
++  {
++    if (!strcmp(printer->connection, "ready"))
++      hardware_message = "Printer ready.";
++    else if (!strcmp(printer->connection, "busy"))
++    {
++      display_state = IPP_PSTATE_PROCESSING;
++      hardware_message = "Refresh deferred while printer is in use.";
++    }
++    else
++    {
++      display_reasons |= IPPEVE_PREASON_OTHER;
++      if (!strcmp(printer->connection, "unknown"))
++        hardware_message = "Printer status unavailable.";
++      else
++      {
++        display_state = IPP_PSTATE_STOPPED;
++        hardware_message = !strcmp(printer->connection, "disconnected") ? "Printer disconnected." :
++                           !strcmp(printer->connection, "recovery") ? "Printer recovery required." : "Printer reported an error.";
++      }
++    }
++  }
+ 
+   if (!copy_attributes(client->response, printer->attrs, ra, IPP_TAG_ZERO))
+   {
+@@ -3921,7 +3973,7 @@
+   }
+ 
+   if (!ra || cupsArrayFind(ra, "printer-state"))
+-    ippAddInteger(client->response, IPP_TAG_PRINTER, IPP_TAG_ENUM, "printer-state", (int)printer->state);
++    ippAddInteger(client->response, IPP_TAG_PRINTER, IPP_TAG_ENUM, "printer-state", (int)display_state);
+ 
+   if (!ra || cupsArrayFind(ra, "printer-state-change-date-time"))
+     ippAddDate(client->response, IPP_TAG_PRINTER, "printer-state-change-date-time", ippTimeToDate(printer->state_time));
+@@ -3933,12 +3985,12 @@
+   {
+     static const char * const messages[] = { "Idle.", "Printing.", "Stopped." };
+ 
+-    ippAddString(client->response, IPP_TAG_PRINTER, IPP_TAG_TEXT, "printer-state-message", NULL, printer->state == IPP_PSTATE_STOPPED && printer->active_job && printer->active_job->message ? printer->active_job->message : messages[printer->state - IPP_PSTATE_IDLE]);
++    ippAddString(client->response, IPP_TAG_PRINTER, IPP_TAG_TEXT, "printer-state-message", NULL, printer->state == IPP_PSTATE_STOPPED && printer->active_job && printer->active_job->message ? printer->active_job->message : hardware_message ? hardware_message : messages[display_state - IPP_PSTATE_IDLE]);
+   }
+ 
+   if (!ra || cupsArrayFind(ra, "printer-state-reasons"))
+   {
+-    if (printer->state_reasons == IPPEVE_PREASON_NONE)
++    if (display_reasons == IPPEVE_PREASON_NONE)
+     {
+       ippAddString(client->response, IPP_TAG_PRINTER, IPP_CONST_TAG(IPP_TAG_KEYWORD), "printer-state-reasons", NULL, "none");
+     }
+@@ -3951,9 +4003,9 @@
+ 
+       for (i = 0, bit = 1; i < (int)(sizeof(ippeve_preason_strings) / sizeof(ippeve_preason_strings[0])); i ++, bit *= 2)
+       {
+-        if (printer->state_reasons & bit)
++        if (display_reasons & bit)
+ 	{
+-	  snprintf(reason, sizeof(reason), "%s-%s", ippeve_preason_strings[i], printer->state == IPP_PSTATE_IDLE ? "report" : printer->state == IPP_PSTATE_PROCESSING ? "warning" : "error");
++	  snprintf(reason, sizeof(reason), "%s-%s", ippeve_preason_strings[i], display_state == IPP_PSTATE_IDLE ? "report" : display_state == IPP_PSTATE_PROCESSING ? "warning" : "error");
+ 	  if (attr)
+ 	    ippSetString(client->response, &attr, ippGetCount(attr), reason);
+ 	  else
+@@ -6956,6 +7008,8 @@
+ 			*myenvp[400];	/* Environment variables */
+     int			myenvc;		/* Number of environment variables */
+     ipp_attribute_t	*attr;		/* Job attribute */
++    ipp_t               *defaults;
++    int                 defaults_ok;
+     char		val[1280],	/* IPP_NAME=value */
+ 			*valptr;	/* Pointer into string */
+ #ifndef _WIN32
+@@ -7021,7 +7075,23 @@
+     }
+ #endif /* !CUPS_LITE */
+ 
+-    for (attr = ippFirstAttribute(job->printer->attrs); attr && myenvc < (int)(sizeof(myenvp) / sizeof(myenvp[0]) - 1); attr = ippNextAttribute(job->printer->attrs))
++    defaults = ippNew();
++    _cupsRWLockRead(&job->printer->rwlock);
++    defaults_ok = copy_attributes(defaults, job->printer->attrs, NULL, IPP_TAG_ZERO);
++    _cupsRWUnlock(&job->printer->rwlock);
++    if (!defaults_ok)
++    {
++      ippDelete(defaults);
++      _cupsRWLockWrite(&job->printer->rwlock);
++      free(job->message);
++      job->message = strdup("Unable to snapshot printer defaults.");
++      _cupsRWUnlock(&job->printer->rwlock);
++      failed = 1;
++      while (myenvc > 0) free(myenvp[--myenvc]);
++      goto error;
++    }
++
++    for (attr = ippFirstAttribute(defaults); attr && myenvc < (int)(sizeof(myenvp) / sizeof(myenvp[0]) - 1); attr = ippNextAttribute(defaults))
+     {
+      /*
+       * Convert "attribute-name-default" to "IPP_ATTRIBUTE_NAME_DEFAULT=" and
+@@ -7055,6 +7125,8 @@
+ 
+       myenvp[myenvc++] = strdup(val);
+     }
++
++    ippDelete(defaults);
+ 
+     for (attr = ippFirstAttribute(job->attrs); attr && myenvc < (int)(sizeof(myenvp) / sizeof(myenvp[0]) - 1); attr = ippNextAttribute(job->attrs))
+     {
+@@ -8044,6 +8116,180 @@
+ }
+ 
+ 
++/* The status helper owns device access. Keep its execution outside the
++ * printer lock and never let a hardware refresh resolve a retained job. */
++static void
++status_apply(ippeve_printer_t *printer, const char *connection, int ribbon, int film)
++{
++  static const char * const names[] = { "marker-levels", "printer-supply", "printer-supply-description", "avansia-connection-state" };
++  static const char * const descriptions[] = { "Color ribbon", "Transfer film" };
++  ipp_attribute_t *attr;
++  int levels[2] = { ribbon, film };
++  char supply[256];
++  size_t i;
++
++  _cupsRWLockWrite(&printer->rwlock);
++  if (!strcmp(printer->connection, connection) && printer->ribbon_level == ribbon && printer->film_level == film)
++  {
++    _cupsRWUnlock(&printer->rwlock);
++    return;
++  }
++  strlcpy(printer->connection, connection, sizeof(printer->connection));
++  printer->ribbon_level = ribbon;
++  printer->film_level = film;
++  for (i = 0; i < sizeof(names) / sizeof(names[0]); i ++)
++    if ((attr = ippFindAttribute(printer->attrs, names[i], IPP_TAG_ZERO)) != NULL)
++      ippDeleteAttribute(printer->attrs, attr);
++  ippAddIntegers(printer->attrs, IPP_TAG_PRINTER, IPP_TAG_INTEGER, "marker-levels", 2, levels);
++  snprintf(supply, sizeof(supply), "index=1;class=supplyThatIsConsumed;type=inkRibbon;unit=percent;maxcapacity=100;level=%d;colorantname=multiple;", ribbon);
++  attr = ippAddOctetString(printer->attrs, IPP_TAG_PRINTER, "printer-supply", supply, (int)strlen(supply));
++  snprintf(supply, sizeof(supply), "index=2;class=supplyThatIsConsumed;type=transferUnit;unit=percent;maxcapacity=100;level=%d;colorantname=none;", film);
++  ippSetOctetString(printer->attrs, &attr, 1, supply, (int)strlen(supply));
++  ippAddStrings(printer->attrs, IPP_TAG_PRINTER, IPP_TAG_TEXT, "printer-supply-description", 2, NULL, descriptions);
++  ippAddString(printer->attrs, IPP_TAG_PRINTER, IPP_TAG_KEYWORD, "avansia-connection-state", NULL, connection);
++  printer->config_time = time(NULL);
++  if (!printer->active_job && printer->state != IPP_PSTATE_STOPPED)
++    printer->state_time = printer->config_time;
++  _cupsRWUnlock(&printer->rwlock);
++}
++
++static int
++status_parse(const char *output, char *connection, int *ribbon, int *film)
++{
++  char prefix[32], state[16], values[2][8], extra, *end;
++  int i, levels[2];
++  long value;
++
++  if (sscanf(output, "%31s %15s %7s %7s %c", prefix, state, values[0], values[1], &extra) != 4 ||
++      strcmp(prefix, "AVANSIA_STATUS_V1") ||
++      (strcmp(state, "ready") && strcmp(state, "busy") && strcmp(state, "recovery") &&
++       strcmp(state, "disconnected") && strcmp(state, "error") && strcmp(state, "unknown")))
++    return (0);
++  for (i = 0; i < 2; i ++)
++  {
++    errno = 0;
++    value = strtol(values[i], &end, 10);
++    if (errno || *end || end == values[i] || value < -1 || value > 100) return (0);
++    levels[i] = (int)value;
++  }
++  strlcpy(connection, state, 16);
++  *ribbon = levels[0];
++  *film = levels[1];
++  return (1);
++}
++
++static double
++status_now(void)
++{
++  struct timespec now;
++  clock_gettime(CLOCK_MONOTONIC, &now);
++  return (now.tv_sec + now.tv_nsec / 1000000000.0);
++}
++
++static void
++status_tick(ippeve_printer_t *printer, ippeve_status_t *probe, double now)
++{
++  int status, fds[2], error, ribbon, film, wait_error;
++  pid_t result;
++  ssize_t bytes;
++  char connection[16];
++  posix_spawn_file_actions_t actions;
++  posix_spawnattr_t attributes;
++  char *arguments[] = { (char *)StatusCommand, "ipp-status", NULL };
++
++  if (!StatusCommand) return;
++  if (probe->pid)
++  {
++    result = waitpid(probe->pid, &status, WNOHANG);
++    wait_error = errno;
++    if (probe->fd >= 0)
++    {
++      while ((bytes = read(probe->fd, probe->output + probe->used, sizeof(probe->output) - probe->used - 1)) > 0)
++      {
++        if (memchr(probe->output + probe->used, '\0', (size_t)bytes)) probe->failed = 1;
++        probe->used += (size_t)bytes;
++        if (probe->used == sizeof(probe->output) - 1)
++        {
++          probe->failed = 1;
++          break;
++        }
++      }
++      if (bytes < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) probe->failed = 1;
++    }
++    if (result == probe->pid || (result < 0 && wait_error != EINTR))
++    {
++      kill(-probe->pid, SIGKILL);
++      if (probe->fd >= 0) close(probe->fd);
++      probe->fd = -1;
++      probe->pid = 0;
++      probe->output[probe->used] = '\0';
++      if (result > 0 && WIFEXITED(status) && !WEXITSTATUS(status) && !probe->failed &&
++          status_parse(probe->output, connection, &ribbon, &film))
++        status_apply(printer, connection, ribbon, film);
++      else
++        status_apply(printer, "unknown", -1, -1);
++      return;
++    }
++    if ((!probe->failed && now >= probe->deadline) || probe->failed == 1)
++    {
++      probe->failed = 2;
++      kill(-probe->pid, SIGKILL);
++      if (probe->fd >= 0) close(probe->fd);
++      probe->fd = -1;
++      status_apply(printer, "unknown", -1, -1);
++    }
++    return;
++  }
++  if (now < probe->next_poll) return;
++  probe->next_poll = now + 15.0;
++  probe->deadline = now + 20.0;
++  probe->failed = 0;
++  probe->used = 0;
++  if (pipe(fds)) { status_apply(printer, "unknown", -1, -1); return; }
++  if (fcntl(fds[0], F_SETFL, O_NONBLOCK))
++  {
++    close(fds[0]); close(fds[1]);
++    status_apply(printer, "unknown", -1, -1);
++    return;
++  }
++  posix_spawn_file_actions_init(&actions);
++  posix_spawn_file_actions_adddup2(&actions, fds[1], STDOUT_FILENO);
++  posix_spawn_file_actions_addclose(&actions, fds[0]);
++  posix_spawn_file_actions_addclose(&actions, fds[1]);
++  posix_spawn_file_actions_addopen(&actions, STDIN_FILENO, "/dev/null", O_RDONLY, 0);
++  posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, "/dev/null", O_WRONLY, 0);
++  posix_spawnattr_init(&attributes);
++  posix_spawnattr_setflags(&attributes, POSIX_SPAWN_CLOEXEC_DEFAULT | POSIX_SPAWN_SETPGROUP);
++  posix_spawnattr_setpgroup(&attributes, 0);
++  error = posix_spawn(&probe->pid, StatusCommand, &actions, &attributes, arguments, environ);
++  posix_spawn_file_actions_destroy(&actions);
++  posix_spawnattr_destroy(&attributes);
++  close(fds[1]);
++  if (error)
++  {
++    close(fds[0]);
++    probe->pid = 0;
++    status_apply(printer, "unknown", -1, -1);
++  }
++  else probe->fd = fds[0];
++}
++
++
++static void
++status_stop(ippeve_status_t *probe)
++{
++  if (probe->pid)
++  {
++    int status;
++    kill(-probe->pid, SIGKILL);
++    while (waitpid(probe->pid, &status, 0) < 0 && errno == EINTR);
++    probe->pid = 0;
++  }
++  if (probe->fd >= 0) close(probe->fd);
++  probe->fd = -1;
++}
++
++
+ /*
+  * 'run_printer()' - Run the printer service.
+  */
+@@ -8053,6 +8299,7 @@
+ {
+   int			num_fds;	/* Number of file descriptors */
+   struct pollfd		polldata[3];	/* poll() data */
++  ippeve_status_t probe = { .fd = -1 };
+   ippeve_client_t	*client;	/* New client */
+ 
+ 
+@@ -8088,6 +8335,7 @@
+ 
+   for (;;)
+   {
++    status_tick(printer, &probe, status_now());
+     if (poll(polldata, (nfds_t)num_fds, 1000) < 0 && errno != EINTR)
+     {
+       perror("poll() failed");
+@@ -8155,6 +8403,7 @@
+ 
+     clean_jobs(printer);
+   }
++  status_stop(&probe);
+ }
+ 
+ 
+@@ -8821,6 +9070,7 @@
+   _cupsLangPuts(stdout, _("--help                  Show program help"));
+   _cupsLangPuts(stdout, _("--no-web-forms          Disable web forms for media and supplies"));
+   _cupsLangPuts(stdout, _("--pam-service service   Use the named PAM service"));
++  _cupsLangPuts(stdout, _("--status-command path   Poll native status with a bounded helper"));
+   _cupsLangPuts(stdout, _("--version               Show program version"));
+   _cupsLangPuts(stdout, _("-2                      Set 2-sided printing support (default=1-sided)"));
+   _cupsLangPuts(stdout, _("-A                      Enable authentication"));

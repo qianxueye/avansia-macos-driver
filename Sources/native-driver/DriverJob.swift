@@ -160,6 +160,30 @@ func cancellationCheck(_ uri: String) throws {
     if result < 0 { throw driverError(String(cString: error)) }
     if result > 0 { throw JobCancelled() }
 }
+func acquireJobLock(check: () throws -> Void,
+                    attempt: () -> (Int32, String) = {
+                        var error = [CChar](repeating: 0, count: 1024)
+                        let result = avansia_lock(&error, error.count)
+                        return (result, String(cString: error))
+                    },
+                    now: () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
+                    pause: (TimeInterval) -> Void = { Thread.sleep(forTimeInterval: $0) }) throws -> Int32 {
+    let deadline = now() + 25
+    var waiting = false
+    while true {
+        if waiting && now() >= deadline { throw driverError("The printer stayed busy for 25 seconds; no card was submitted") }
+        try check()
+        if waiting && now() >= deadline { throw driverError("The printer stayed busy for 25 seconds; no card was submitted") }
+        let (descriptor, message) = attempt()
+        if descriptor >= 0 { return descriptor }
+        guard descriptor == AVANSIA_LOCK_BUSY else { throw driverError(message) }
+        if !waiting { log("INFO: Waiting for the printer device lock") }
+        waiting = true
+        let remaining = deadline - now()
+        guard remaining > 0 else { throw driverError("The printer stayed busy for 25 seconds; no card was submitted") }
+        pause(min(0.25, remaining))
+    }
+}
 func executePlan(_ plan: PrintPlan, check: () throws -> Void, printCard: (Card) throws -> Bool) throws {
     var completed = 0
     log("ATTR: job-impressions=\(plan.impressions)")
@@ -200,10 +224,7 @@ func runJob() throws {
     guard args.count == 2, let uri = env["IPP_JOB_URI"] else { throw driverError("This command must be started by the Avansia IPP service") }
     guard env["CONTENT_TYPE"] == "application/pdf" else { throw driverError("Only PDF print documents are supported") }
     let options = try PrintOptions(env)
-    try cancellationCheck(uri)
-    var error = [CChar](repeating: 0, count: 1024)
-    let lock = avansia_lock(&error, error.count)
-    guard lock >= 0 else { throw driverError(String(cString: error)) }
+    let lock = try acquireJobLock(check: { try cancellationCheck(uri) })
     defer { close(lock) }
     guard !FileManager.default.fileExists(atPath: driverBase.appendingPathComponent("state/inflight.json").path) else { throw driverError("A previous card has an uncertain outcome; inspect it before submitting another job") }
     let status = try runNative(runtimeRoot.appendingPathComponent("AvansiaCore"), ["ribbon", "--lock-fd", "198"], lock: lock)

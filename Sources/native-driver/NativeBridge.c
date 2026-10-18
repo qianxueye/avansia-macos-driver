@@ -81,7 +81,13 @@ int avansia_lock(char *error, size_t capacity) {
         close(fd); return failure(error, capacity, "Invalid printer lock file");
     }
     if (flock(fd, LOCK_EX | LOCK_NB)) {
-        close(fd); return failure(error, capacity, "Another process is using the printer");
+        int lock_error = errno;
+        close(fd);
+        if (lock_error == EWOULDBLOCK || lock_error == EAGAIN) {
+            failure(error, capacity, "Another process is using the printer");
+            return AVANSIA_LOCK_BUSY;
+        }
+        return failure(error, capacity, "Cannot acquire the printer lock");
     }
     return fd;
 }

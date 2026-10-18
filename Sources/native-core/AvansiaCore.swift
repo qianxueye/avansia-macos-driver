@@ -190,10 +190,7 @@ final class USB {
     }
     func status() throws -> [String: Any] {
         let info = try query(89,52), state = try query(84,60)
-        try require(info.count >= 51 && state.count >= 60, "Printer information response is incomplete")
-        let flags = state[0]
-        func ascii(_ range: Range<Int>) -> String { String(bytes: info[range], encoding: .ascii)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "" }
-        return ["model": "Evolis Avansia", "firmware": ascii(38..<42), "base_revision": ascii(34..<38), "serial": ascii(42..<50), "printer_id": info[50], "ribbon_type_code": info[2], "ribbon_panel_code": info[3], "ribbon_remaining_percent": state[42] <= 100 ? Int(state[42]) as Any : NSNull(), "film_remaining_percent": state[43] <= 100 ? Int(state[43]) as Any : NSNull(), "ready": flags & 0x11 == 0x11 && flags & 4 == 0, "printing": flags & 8 != 0, "error": flags & 4 != 0, "flags": String(format: "%02x", flags), "status_payload": hex(state)]
+        return try decodeDeviceStatus(info,state)
     }
     func send(_ command: UInt8, _ payload: [UInt8]) throws {
         try write([28,command] + be32(payload.count) + payload)
@@ -503,6 +500,7 @@ func prepare(_ front: String, _ output: String, _ ribbon: String, _ back: String
 
 var inheritedLock: Int32? = nil
 var jobURI: String? = nil
+var coreTextOutput:String?
 func checkCancellation() throws -> Bool {
     if avansia_interrupted() != 0 { return true }
     guard let jobURI else { return false }
@@ -522,6 +520,24 @@ func coreMain() throws -> [String: Any] {
     jobURI = try option("--job-uri")
     try require(!args.isEmpty,"Usage: AvansiaCore status|ribbon|prepare FRONTBMP OUTPUTPRN --ribbon YMCK|YMCKK [--back BMP] [--rotate-back] [--front-black MASK --back-black MASK] [--color-profile JSON]|print PRN --confirm-one-card")
     let command = args.removeFirst()
+    if command == "snapshot" {
+        try require(args.isEmpty || args==["--refresh-details"],"Usage: snapshot [--refresh-details]")
+        return try DeviceManager().snapshot(refreshDetails:!args.isEmpty)
+    }
+    if command == "ipp-status" {
+        let value=args.isEmpty ? (try? DeviceManager().snapshot()) ?? ["connection":"unknown"] : ["connection":"unknown"]
+        coreTextOutput=deviceIPPLine(value)
+        return [:]
+    }
+    if command == "settings" {
+        try require(args.isEmpty,"Usage: settings")
+        return try DeviceManager().settings()
+    }
+    if command == "set-setting" {
+        try require(args.count==3,"Usage: set-setting ID EXPECTED VALUE")
+        guard let expected=Int(args[1]),let value=Int(args[2]) else { throw Failure("Setting values must be integers") }
+        return try DeviceManager().setSetting(args[0],expected:expected,value:value)
+    }
     if command == "validate" {
         try require(args.count == 1,"Usage: validate PRN")
         let records = try readJob(args[0]); return ["valid":true,"wire_blocks":records.filter { $0.checkpoint == nil }.count]
@@ -572,7 +588,15 @@ func selfTest() throws -> [String: Any] {
 @main struct CoreEntry {
     static func main() {
         avansia_install_signals()
-        do { emit(try coreMain()) } catch { emit(["error":String(describing:error)]); exit(1) }
+        do {
+            let result=try coreMain()
+            if let text=coreTextOutput { print(text) } else { emit(result) }
+        } catch {
+            if let setting=error as? SettingFailure {
+                emit(["error":setting.description,"write_attempted":setting.writeAttempted,"refresh_required":setting.refreshRequired,"automatic_retries":0])
+            } else { emit(["error":String(describing:error)]) }
+            exit(1)
+        }
     }
 }
 #endif
