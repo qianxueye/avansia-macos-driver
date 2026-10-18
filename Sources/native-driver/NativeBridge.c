@@ -35,7 +35,7 @@ int avansia_queue_uri(const char *name, char *uri, size_t uri_capacity, char *er
     if (snprintf(resource, sizeof(resource), "/printers/%s", name) >= (int)sizeof(resource))
         return failure(error, error_capacity, "The queue name exceeds its buffer");
     snprintf(printer_uri, sizeof(printer_uri), "ipp://localhost:631%s", resource);
-    http_t *http = httpConnect2("localhost", 631, NULL, AF_UNSPEC, HTTP_ENCRYPTION_IF_REQUESTED, 1, 2000, NULL);
+    http_t *http = httpConnect2("/private/var/run/cupsd", 631, NULL, AF_UNSPEC, HTTP_ENCRYPTION_IF_REQUESTED, 1, 2000, NULL);
     if (!http) return failure(error, error_capacity, "Cannot connect to local CUPS to query the queue");
     httpSetTimeout(http, 2.0, NULL, NULL);
     ipp_t *request = ippNewRequest(IPP_OP_GET_PRINTER_ATTRIBUTES);

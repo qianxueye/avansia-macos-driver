@@ -7,7 +7,7 @@
 static int mode, connections, requests, closes;
 http_t *setup_test_connect(const char *host, int port, http_addrlist_t *addresses, int family,
                           http_encryption_t encryption, int blocking, int msec, int *cancel) {
-    assert(!strcmp(host, "localhost") && port == 631 && !addresses && family == AF_UNSPEC);
+    assert(!strcmp(host, "/private/var/run/cupsd") && port == 631 && !addresses && family == AF_UNSPEC);
     assert(encryption == HTTP_ENCRYPTION_IF_REQUESTED && blocking && msec == 2000 && !cancel);
     ++connections;
     return mode == 1 ? NULL : (http_t *)1;
@@ -57,6 +57,6 @@ int main(void) {
     mode = 0;
     assert(avansia_queue_uri("Evolis_Avansia", uri, 2, error, sizeof(error)) == -1);
     assert(uri[0] == '\0');
-    puts("PASS: Native queue identity uses only bounded local Get-Printer-Attributes; exact/foreign URI, explicit not-found, connection/transport/auth errors, missing/duplicate/wrong-type/multiple/empty attributes and exact printer-name and buffer truncation remain distinct");
+    puts("PASS: Native queue identity uses only bounded local Unix-socket Get-Printer-Attributes; exact/foreign URI, explicit not-found, connection/transport/auth errors, missing/duplicate/wrong-type/multiple/empty attributes and exact printer-name and buffer truncation remain distinct");
     return 0;
 }

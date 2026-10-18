@@ -23,7 +23,12 @@ func safetyJob(_ masks: [[UInt8]], color: Bool = true, seed: Int = 0) -> [Record
         if color {
             records.append(safetyFrame(colorPreparation))
             for channel in 0..<3 {
-                records.append(safetyPlane((0..<safetyCount).map { UInt8(($0 + face * 71 + channel * 37 + seed) % 251 + 1) }))
+                let shift = face * 71 + channel * 37 + seed
+                let pixels = (0..<safetyCount).map { index -> UInt8 in
+                    let value = (index + shift) % 251 + 1
+                    return UInt8(value)
+                }
+                records.append(safetyPlane(pixels))
             }
         }
         records += [safetyFrame(blackPreparation), safetyPlane(masks[face])]

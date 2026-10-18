@@ -74,8 +74,10 @@ typed setting after its read protocol is established.
 ## Packaging and licensing
 
 Installation identity is read through `AvansiaSetup queue-info`. The native
-bridge queries the explicit local scheduler for the exact queue name and
-device URI. Only an explicit IPP not-found response means absence; connection,
+bridge sends read-only Get-Printer-Attributes requests over the fixed macOS
+Unix socket `/private/var/run/cupsd`, with the logical printer URI
+`ipp://localhost:631/printers/Evolis_Avansia`. It validates the exact queue name
+and device URI independently of `CUPS_SERVER` or user destination options. Only an explicit IPP not-found response means absence; connection,
 authorization and malformed-response failures remain errors. Human-readable
 CUPS output is not an identity interface, and command locale settings do not
 guarantee the language selected by macOS CUPS. Retained runtime files are
