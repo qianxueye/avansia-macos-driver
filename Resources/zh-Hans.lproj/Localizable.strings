@@ -217,3 +217,11 @@
 "DISCONNECTED" = "未连接";
 "The recovery record was not cleared. Confirm physical inspection and resolve queued jobs before trying again." = "恢复记录尚未清除。请确认已完成实物检查，并处理队列中的作业后再操作。";
 "The stopped job was not canceled. Check the job number and resolve local jobs in Print Center first." = "未能取消已停止的作业。请核对作业编号，并先在打印中心处理本机作业。";
+"Installation not verified" = "尚未核实安装状态";
+"Installation needs attention" = "驱动安装需要处理";
+"Check installation to verify the print queue and user service." = "请检查安装状态，以核实打印队列和当前用户的服务。";
+"The print queue and user service are absent. Retained runtime files do not mean the driver is installed." = "打印队列和当前用户的服务尚未安装。保留的运行时文件不代表驱动仍已安装。";
+"The queue, user service, or runtime is incomplete. Check the details before updating or uninstalling." = "打印队列、用户服务或运行时不完整。请查看详情，再决定更新或卸载。";
+"Runtime files" = "运行时文件";
+"Unavailable" = "不可用";
+"Printing requires a verified installation with no recovery pending." = "打印前必须核实驱动安装完整，并处理尚未完成的恢复事项。";

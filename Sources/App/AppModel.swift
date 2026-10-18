@@ -124,7 +124,11 @@ struct CommandResult: Sendable {
     let status: Int32
     let output: String
 }
-struct NativeCommandRunner {
+protocol AppCommandRunning {
+    func run(_ executable: URL, _ arguments: [String], timeout: TimeInterval,
+             progress: @escaping @Sendable (String) -> Void) async throws -> CommandResult
+}
+struct NativeCommandRunner: AppCommandRunning {
     func run(_ executable: URL, _ arguments: [String], timeout: TimeInterval = 60,
              progress: @escaping @Sendable (String) -> Void = { _ in }) async throws -> CommandResult {
         try await withCheckedThrowingContinuation { continuation in
@@ -140,6 +144,10 @@ struct NativeCommandRunner {
                     let process = Process()
                     process.executableURL = executable
                     process.arguments = arguments
+                    var environment = ProcessInfo.processInfo.environment
+                    environment["LC_ALL"] = "C"
+                    environment["LANG"] = "C"
+                    process.environment = environment
                     process.standardOutput = output
                     process.standardError = output
                     process.standardInput = FileHandle.nullDevice
@@ -179,6 +187,9 @@ struct NativeCommandRunner {
     @Published var snapshot: PrinterSnapshot?
     @Published var settings: SettingsSnapshot?
     @Published var runtimeAvailable = false
+    @Published var installationState: AppInstallationState = .unknown
+    @Published var installationDetails = ""
+    @Published var checkingInstallation = false
     @Published var cacheError: String?
     @Published var cacheDetails: String?
     @Published var operation: String?
@@ -192,13 +203,18 @@ struct NativeCommandRunner {
     let base: URL
     let package: URL
     let fixture: URL?
-    private let runner: NativeCommandRunner
+    private let runner: any AppCommandRunning
+    private let installationProbe: AppInstallationProbe
     private var commandID: UUID?
     var runtime: URL { base.appendingPathComponent("runtime") }
     var core: URL { runtime.appendingPathComponent("AvansiaCore") }
     var setup: URL { package.appendingPathComponent("AvansiaSetup") }
     var imageURL: URL { runtime.appendingPathComponent("Assets/Avansia.png") }
-    var commandsAllowed: Bool { fixture == nil && operation == nil }
+    var commandsAllowed: Bool { fixture == nil && operation == nil && !checkingInstallation }
+    var canInstall: Bool { commandsAllowed && installationState == .notInstalled }
+    var canUpdate: Bool { commandsAllowed && runtimeAvailable && [.installed, .incomplete].contains(installationState) }
+    var canUninstall: Bool { commandsAllowed && [.installed, .incomplete].contains(installationState) }
+    var canPrint: Bool { commandsAllowed && runtimeAvailable && installationState == .installed && snapshot?.recoveryRequired != true }
     var stale: Bool { cacheError != nil || snapshot?.isStale() != false }
     var canReadDetails: Bool { commandsAllowed && runtimeAvailable && snapshot?.busy != true && snapshot?.recoveryRequired != true }
     var canChangeSettings: Bool { canReadDetails && snapshot?.connection == "ready" && !stale && !settingsNeedRefresh }
@@ -206,8 +222,8 @@ struct NativeCommandRunner {
     init(base: URL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/AvansiaDriver"),
          package: URL = (Bundle.main.resourceURL ?? Bundle.main.bundleURL).appendingPathComponent("Driver"),
          fixture: URL? = ProcessInfo.processInfo.environment["AVANSIA_UI_FIXTURE"].map { URL(fileURLWithPath: $0) },
-         runner: NativeCommandRunner = NativeCommandRunner()) {
-        self.base = base; self.package = package; self.fixture = fixture; self.runner = runner
+         runner: any AppCommandRunning = NativeCommandRunner(), installationProbe: AppInstallationProbe = AppInstallationProbe()) {
+        self.base = base; self.package = package; self.fixture = fixture; self.runner = runner; self.installationProbe = installationProbe
     }
     func reloadCache() {
         runtimeAvailable = FileManager.default.isExecutableFile(atPath: core.path)
@@ -215,7 +231,10 @@ struct NativeCommandRunner {
         do {
             let data = try Data(contentsOf: path)
             let object = try JSONSerialization.jsonObject(with: data) as? [String: Any]
-            if fixture != nil { runtimeAvailable = object?["runtime_available"] as? Bool ?? true }
+            if fixture != nil {
+                runtimeAvailable = object?["runtime_available"] as? Bool ?? true
+                installationState = (object?["installation_state"] as? String).flatMap(AppInstallationState.init(rawValue:)) ?? .unknown
+            }
             let snapshotData = try object?["snapshot"].map { try JSONSerialization.data(withJSONObject: $0) } ?? data
             let decoded = try JSONDecoder().decode(PrinterSnapshot.self, from: snapshotData)
             guard decoded.schema_version == 1 else { throw AppFailure.message("Unsupported status format") }
@@ -234,6 +253,21 @@ struct NativeCommandRunner {
         while !Task.isCancelled {
             reloadCache()
             try? await Task.sleep(nanoseconds: 1_500_000_000)
+        }
+    }
+    func refreshInstallation() async {
+        guard commandsAllowed else { return }
+        checkingInstallation = true
+        defer { checkingInstallation = false }
+        let result = await installationProbe.inspect()
+        runtimeAvailable = FileManager.default.isExecutableFile(atPath: core.path)
+        installationState = result.state == .installed && !runtimeAvailable ? .incomplete : result.state
+        installationDetails = result.details
+    }
+    func pollInstallation() async {
+        while !Task.isCancelled {
+            await refreshInstallation()
+            try? await Task.sleep(nanoseconds: 15_000_000_000)
         }
     }
     @discardableResult private func perform(_ title: String, executable: URL, arguments: [String], timeout: TimeInterval = 60) async -> String? {
@@ -290,9 +324,11 @@ struct NativeCommandRunner {
     }
     func setupAction(_ command: String) async {
         guard ["install", "upgrade", "uninstall", "status"].contains(command), commandsAllowed else { return }
+        guard command != "install" || canInstall, command != "upgrade" || canUpdate, command != "uninstall" || canUninstall else { return }
         let arguments = [command] + (["install", "upgrade"].contains(command) ? [package.path] : [])
         let titles = ["install": "Installing driver", "upgrade": "Updating driver", "uninstall": "Uninstalling driver", "status": "Checking installation"]
         _ = await perform(AppStrings.text(titles[command]!), executable: setup, arguments: arguments, timeout: 900)
+        if command != "status" { await refreshInstallation() }
     }
     func importSDK(_ url: URL) async {
         guard commandsAllowed else { return }
@@ -309,6 +345,12 @@ struct NativeCommandRunner {
     func printPDF(_ url: URL, copies: Int, sides: String, scaling: String) async {
         guard commandsAllowed, runtimeAvailable, snapshot?.recoveryRequired != true, (1...100).contains(copies),
               ["one-sided", "two-sided-long-edge", "two-sided-short-edge"].contains(sides), ["none", "fit", "fill"].contains(scaling) else { return }
+        await refreshInstallation()
+        guard canPrint else {
+            actionError = AppStrings.text("Printing requires a verified installation with no recovery pending.")
+            actionDetails = installationDetails
+            return
+        }
         if await perform(AppStrings.text("Submitting PDF to the print queue"), executable: URL(fileURLWithPath: "/usr/bin/lp"), arguments: ["-d", "Evolis_Avansia", "-n", String(copies), "-o", "sides=" + sides, "-o", "print-scaling=" + scaling, "-o", "media=iso_id-1_53.98x85.6mm", url.path]) != nil {
             notice = AppStrings.text("The PDF was submitted to the queue. Check Print Center for job status.")
         }

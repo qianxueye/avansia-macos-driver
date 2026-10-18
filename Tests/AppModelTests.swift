@@ -4,6 +4,36 @@ import Darwin
 func expect(_ condition: @autoclosure () -> Bool, _ message: String) throws {
     if !condition() { throw AppFailure.message("Test failed: " + message) }
 }
+actor InstallationCommandFixture: AppCommandRunning {
+    var queue = CommandResult(status: 0, output: "device for OtherFixture: file:///dev/null\n")
+    var service = CommandResult(status: 113, output: "Could not find service \"local.avansia.ipp\" in domain for user gui: 501\n")
+    var calls: [(String, [String])] = []
+    var failNextProbe = false
+    func configure(queue: CommandResult, service: CommandResult) { self.queue = queue; self.service = service }
+    func timeoutNextProbe() { failNextProbe = true }
+    func history() -> [(String, [String])] { calls }
+    func run(_ executable: URL, _ arguments: [String], timeout: TimeInterval, progress: @escaping @Sendable (String) -> Void) async throws -> CommandResult {
+        calls.append((executable.path, arguments))
+        if executable.path == "/usr/bin/lpstat" {
+            try expect(arguments == ["-v"] && timeout == 4, "Queue probe is bounded and read-only")
+            if failNextProbe { failNextProbe = false; throw AppFailure.timedOut("device for OtherFixture: file:///dev/null") }
+            try await Task.sleep(nanoseconds: 30_000_000)
+            return queue
+        }
+        if executable.path == "/bin/launchctl" {
+            try expect(arguments == ["print", "gui/\(getuid())/local.avansia.ipp"] && timeout == 4, "Service probe targets only the driver service")
+            return service
+        }
+        if arguments.first == "uninstall" {
+            queue = CommandResult(status: 0, output: "")
+            service = CommandResult(status: 113, output: "Could not find service \"local.avansia.ipp\" in domain for user gui: 501\n")
+        } else if arguments.first == "install" {
+            queue = CommandResult(status: 0, output: "device for Evolis_Avansia: ipp://localhost:18631/ipp/print\n")
+            service = CommandResult(status: 0, output: "Synthetic loaded service\n")
+        }
+        return CommandResult(status: 0, output: "Synthetic command completed\n")
+    }
+}
 @main struct AppModelTests {
     @MainActor static func main() async throws {
         try expect(Bundle.main.preferredLocalizations.first == "zh-Hans", "The packaged development language is Simplified Chinese")
@@ -37,10 +67,66 @@ func expect(_ condition: @autoclosure () -> Bool, _ message: String) throws {
         model.reloadCache()
         try expect(!model.runtimeAvailable && model.cacheError != nil && !model.canReadDetails, "Missing runtime is visible and blocks native commands")
         let helper = URL(fileURLWithPath: CommandLine.arguments[1])
+        func verifyCommandLocale() async throws {
+            let previousAll = getenv("LC_ALL").map { String(cString: $0) }
+            let previousLanguage = getenv("LANG").map { String(cString: $0) }
+            defer {
+                if let previousAll { setenv("LC_ALL", previousAll, 1) } else { unsetenv("LC_ALL") }
+                if let previousLanguage { setenv("LANG", previousLanguage, 1) } else { unsetenv("LANG") }
+            }
+            setenv("LC_ALL", "zh_CN.UTF-8", 1)
+            setenv("LANG", "zh_CN.UTF-8", 1)
+            let result = try await NativeCommandRunner().run(helper, ["locale"])
+            let environment = try JSONSerialization.jsonObject(with: Data(result.output.utf8)) as? [String: String]
+            try expect(result.status == 0 && environment?["LC_ALL"] == "C" && environment?["LANG"] == "C", "Native command boundary overrides inherited Chinese locale with canonical C output")
+            try expect(AppStrings.text("Unknown") == "\u{672A}\u{77E5}", "Command locale does not change the localized Chinese UI")
+        }
+        try await verifyCommandLocale()
         for path in [runtime.appendingPathComponent("AvansiaCore"), package.appendingPathComponent("AvansiaSetup")] {
             try FileManager.default.copyItem(at: helper, to: path)
         }
         try write(snapshot())
+        let probeRunner = InstallationCommandFixture()
+        let installation = UtilityModel(base: base, package: package, fixture: nil, runner: probeRunner,
+                                        installationProbe: AppInstallationProbe(runner: probeRunner))
+        installation.reloadCache()
+        await installation.refreshInstallation()
+        try expect(installation.runtimeAvailable && installation.installationState == .notInstalled && installation.canInstall && !installation.canPrint && !installation.canUpdate,
+                   "Retained runtime with no queue or loaded agent is not installed, permits Install, and blocks Print")
+        try expect(!installation.installationDetails.contains("OtherFixture"), "Installation diagnostics do not retain unrelated printer output")
+        try expect(installation.canReadDetails, "Retained runtime remains available for explicit diagnostics")
+        await installation.printPDF(folder.appendingPathComponent("never-submitted.pdf"), copies: 1, sides: "one-sided", scaling: "none")
+        var probeCalls = await probeRunner.history()
+        try expect(!probeCalls.contains { $0.0 == "/usr/bin/lp" }, "Removed queue is rejected before PDF submission")
+        await installation.setupAction("install")
+        try expect(installation.installationState == .installed && installation.canPrint && !installation.canInstall, "Successful setup refreshes verified installation state")
+        await installation.setupAction("uninstall")
+        try expect(installation.runtimeAvailable && installation.installationState == .notInstalled && installation.canInstall && !installation.canPrint,
+                   "Successful uninstall refreshes the UI even when runtime files remain")
+        let ownedQueue = CommandResult(status: 0, output: "device for Evolis_Avansia: ipp://localhost:18631/ipp/print\n")
+        let loadedService = CommandResult(status: 0, output: "Synthetic loaded service\n")
+        let absentService = CommandResult(status: 113, output: "Could not find service \"local.avansia.ipp\" in domain for user gui: 501\n")
+        for (queue, service) in [(ownedQueue, absentService), (CommandResult(status: 0, output: ""), loadedService),
+                                 (CommandResult(status: 0, output: "device for Evolis_Avansia: ipp://elsewhere.invalid/ipp/print\n"), loadedService)] {
+            await probeRunner.configure(queue: queue, service: service)
+            await installation.refreshInstallation()
+            try expect(installation.installationState == .incomplete && !installation.canPrint && installation.canUninstall, "Incomplete or foreign-endpoint installation never enables Print")
+        }
+        await probeRunner.configure(queue: ownedQueue, service: CommandResult(status: 113, output: "Could not find domain for user gui: 501\n"))
+        await installation.refreshInstallation()
+        try expect(installation.installationState == .unknown && !installation.canInstall && !installation.canPrint, "Query errors are not treated as clean absence")
+        await probeRunner.timeoutNextProbe()
+        await installation.refreshInstallation()
+        try expect(installation.installationState == .unknown && !installation.installationDetails.contains("OtherFixture"), "Probe timeouts fail closed without retaining unrelated queue output")
+        await probeRunner.configure(queue: ownedQueue, service: loadedService)
+        let beforeProbe = await probeRunner.history().count
+        let activeProbe = Task { await installation.refreshInstallation() }
+        try await Task.sleep(nanoseconds: 10_000_000)
+        try expect(installation.checkingInstallation && !installation.commandsAllowed, "Installation queries keep the UI responsive and prevent overlapping commands")
+        await installation.refreshInstallation()
+        await activeProbe.value
+        probeCalls = await probeRunner.history()
+        try expect(probeCalls.count == beforeProbe + 2, "Concurrent installation checks do not overlap")
         model.reloadCache()
         try expect(model.runtimeAvailable && model.snapshot?.ribbon?.percent == nil && model.snapshot?.ribbon?.percentText == AppStrings.text("Unknown"), "Unknown percentage never becomes zero")
         try expect(model.snapshot?.film?.percent == 0 && model.snapshot?.film?.percentText == "0%", "Actual zero remains zero")
@@ -84,15 +170,19 @@ func expect(_ condition: @autoclosure () -> Bool, _ message: String) throws {
         try expect(model.actionError == AppStrings.text("The recovery record was not cleared. Confirm physical inspection and resolve queued jobs before trying again.") && model.inspected && model.snapshot?.recoveryRequired == true, "Recovery failure gives localized next steps without clearing inspection or uncertainty state")
         let fixture = folder.appendingPathComponent("fixture.json")
         try write(["runtime_available": true, "snapshot": snapshot()], to: fixture)
-        let preview = UtilityModel(base: folder.appendingPathComponent("absent"), package: package, fixture: fixture)
+        let preview = UtilityModel(base: folder.appendingPathComponent("absent"), package: package, fixture: fixture,
+                                   runner: probeRunner, installationProbe: AppInstallationProbe(runner: probeRunner))
         preview.reloadCache(); preview.reloadCache()
         try expect(preview.runtimeAvailable && !preview.commandsAllowed, "Fixture mode remains stable and forbids live commands")
-        await preview.refreshDetails(); await preview.setupAction("install")
+        let beforeFixtureProbe = await probeRunner.history().count
+        await preview.refreshDetails(); await preview.setupAction("install"); await preview.refreshInstallation()
+        let afterFixtureProbe = await probeRunner.history().count
+        try expect(beforeFixtureProbe == afterFixtureProbe, "Fixture mode never probes the system installation")
         try expect(preview.operation == nil, "Fixture controls never launch hardware or installation")
         do {
             _ = try await NativeCommandRunner().run(helper, ["sleep"], timeout: 0.1)
             throw AppFailure.message("Test failed: timeout was accepted")
         } catch { try expect(error.localizedDescription.contains("timed out"), "Command timeout is reported") }
-        print("PASS: packaged zh-Hans resources and interpolation, localized status/settings/recovery/errors, preserved technical diagnostics, app cache polling, unknown/zero supplies, stale/disconnected/missing runtime, recovery gates, expected-value writes, retry block, responsive/nonoverlapping failure/timeout, and fixture isolation")
+        print("PASS: canonical C command locale under inherited Chinese environment, unchanged zh-Hans UI, retained-runtime installation separation, verified queue/service and endpoint, setup refresh, incomplete/error print gates, nonoverlapping read-only probes, fixture isolation, status/recovery/settings safety, responsive commands and timeouts")
     }
 }

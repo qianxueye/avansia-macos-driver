@@ -19,5 +19,5 @@ cat > "$TEST_BUNDLE/Contents/Info.plist" <<'PLIST'
 </dict></plist>
 PLIST
 plutil -lint "$ROOT/Resources/zh-Hans.lproj/Localizable.strings" "$ROOT/Resources/zh-Hans.lproj/InfoPlist.strings"
-xcrun swiftc -target arm64-apple-macosx14.0 -module-cache-path "$OUTPUT/module-cache" -parse-as-library "$ROOT/Sources/App/AppLocalization.swift" "$ROOT/Sources/App/AppModel.swift" "$ROOT/Tests/AppModelTests.swift" -o "$TEST_BUNDLE/Contents/MacOS/AppModelTests"
+xcrun swiftc -target arm64-apple-macosx14.0 -module-cache-path "$OUTPUT/module-cache" -parse-as-library "$ROOT/Sources/App/AppLocalization.swift" "$ROOT/Sources/App/AppInstallation.swift" "$ROOT/Sources/App/AppModel.swift" "$ROOT/Tests/AppModelTests.swift" -o "$TEST_BUNDLE/Contents/MacOS/AppModelTests"
 "$TEST_BUNDLE/Contents/MacOS/AppModelTests" "$OUTPUT/AppFixtureCommand"

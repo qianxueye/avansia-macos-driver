@@ -56,6 +56,7 @@ All local source changes are supplied in the accompanying patches.
 The matching libcups is statically linked; only Apple system dependencies remain.
 This build does not install or replace host CUPS components.
 EOF
+xcrun strip -S "$runtime/bin/ippeveprinter"
 codesign --force --sign - "$runtime/bin/ippeveprinter"
 codesign --verify --verbose=2 "$runtime/bin/ippeveprinter"
 file "$runtime/bin/ippeveprinter"

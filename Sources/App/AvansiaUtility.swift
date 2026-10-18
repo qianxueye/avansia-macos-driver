@@ -14,6 +14,7 @@ import UniformTypeIdentifiers
                     if let image = NSImage(contentsOf: model.imageURL) { NSApp.applicationIconImage = image }
                     await model.pollCache()
                 }
+                .task { await model.pollInstallation() }
         }
         .defaultSize(width: 1020, height: 740)
         .commands { CommandGroup(replacing: .newItem) {} }
@@ -47,7 +48,7 @@ struct UtilityWindow: View {
             .safeAreaInset(edge: .bottom) {
                 VStack(alignment: .leading, spacing: 6) {
                     Text("Evolis Avansia").font(.headline)
-                    Text(AppStrings.text(model.runtimeAvailable ? "Driver installed" : "Driver not installed")).font(.caption).foregroundStyle(.secondary)
+                    Text(model.checkingInstallation ? AppStrings.text("Checking installation") : model.installationState.title).font(.caption).foregroundStyle(.secondary)
                     if model.fixture != nil { Label("Preview data", systemImage: "testtube.2").font(.caption) }
                 }.padding()
             }
@@ -315,7 +316,7 @@ struct PrintPDFView: View {
                 Text("CR80 53.98 × 85.60 mm · 600 dpi").font(.caption).foregroundStyle(.secondary)
                 Spacer()
                 Button("Print…") { confirmPrint = true }.buttonStyle(.borderedProminent)
-                    .disabled(source == nil || documentError != nil || !model.commandsAllowed || !model.runtimeAvailable || model.snapshot?.recoveryRequired == true)
+                    .disabled(source == nil || documentError != nil || !model.canPrint)
             }
         }.padding(24)
         .fileImporter(isPresented: $choosing, allowedContentTypes: [.pdf]) { result in
@@ -378,7 +379,9 @@ struct InstallationView: View {
     @State private var confirmUninstall = false
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
-            Text(AppStrings.text(model.runtimeAvailable ? "The driver is installed for this user." : "Install the driver for this user to enable printing and monitoring.")).font(.title3)
+            Text(model.installationState.explanation).font(.title3)
+            StatusLine(title: "Runtime files", value: AppStrings.text(model.runtimeAvailable ? "Available" : "Unavailable"))
+            if !model.installationDetails.isEmpty { TechnicalDetails(text: model.installationDetails) }
             Text("Setup reports dependency downloads and installation progress below. Existing jobs and recovery records must be resolved before removing the driver.").foregroundStyle(.secondary)
             Text("Installation downloads the proprietary Evolis SDK from its original distribution. You can also import an official version 9.4.1 SDK archive or library. No Python runtime is required.").font(.callout).foregroundStyle(.secondary)
             HStack {
@@ -395,11 +398,11 @@ struct InstallationView: View {
                 Button("Open Official SDK Page") { NSWorkspace.shared.open(URL(string: "https://www2.evolis.com/sdk")!) }
             }
             HStack {
-                Button("Install") { Task { await model.setupAction("install") } }.disabled(!model.commandsAllowed || model.runtimeAvailable)
-                Button("Update") { Task { await model.setupAction("upgrade") } }.disabled(!model.commandsAllowed || !model.runtimeAvailable)
-                Button("Check Installation") { Task { await model.setupAction("status") } }.disabled(!model.commandsAllowed)
+                Button("Install") { Task { await model.setupAction("install") } }.disabled(!model.canInstall)
+                Button("Update") { Task { await model.setupAction("upgrade") } }.disabled(!model.canUpdate)
+                Button("Check Installation") { Task { await model.refreshInstallation() } }.disabled(!model.commandsAllowed)
                 Spacer()
-                Button("Uninstall…", role: .destructive) { confirmUninstall = true }.disabled(!model.commandsAllowed || !model.runtimeAvailable)
+                Button("Uninstall…", role: .destructive) { confirmUninstall = true }.disabled(!model.canUninstall)
             }
             if model.output.isEmpty { Text("Command output will appear here.").foregroundStyle(.secondary) }
             else { TechnicalDetails(text: model.output) }
