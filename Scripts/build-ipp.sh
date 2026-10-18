@@ -36,7 +36,7 @@ export MACOSX_DEPLOYMENT_TARGET=14.0
     --disable-pam --disable-gssapi --disable-dbus --disable-acl \
     --disable-libusb --disable-libpaper --with-tls=cdsa \
     --with-dnssd=mdnsresponder --with-archflags='-arch arm64' \
-    --with-ldarchflags='-arch arm64' --prefix="$runtime" \
+    --with-ldarchflags='-arch arm64' --prefix=/usr/local \
     > "$build/configure.log" 2>&1
 make -C cups clean > "$build/clean.log" 2>&1
 make -C tools clean >> "$build/clean.log" 2>&1
